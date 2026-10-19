@@ -1,0 +1,58 @@
+# Local documentation, including all Superpowers specs and plans
+# Never commit these files, even from a temporary branch or worktree.
+docs/
+doc/
+
+# Local agent instructions, indexes, and worktrees
+AGENTS.md
+.codegraph/
+.worktrees/
+worktrees/
+
+# Browser profiles, crawl datasets, reports, and runtime logs
+/runtime/
+/data/
+/logs/
+*.log
+*.log.*
+
+# Local configuration and secrets; keep configuration templates versioned
+/config.yaml
+.env
+.env.*
+!.env.example
+
+# Python environments and bytecode
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+
+# Test, type-checker, linter, and coverage artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Python packaging output (dependency lockfiles remain versioned)
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Temporary files, editor backups, and OS metadata
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
