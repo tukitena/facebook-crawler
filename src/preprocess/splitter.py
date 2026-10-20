@@ -3,6 +3,7 @@
 from collections import Counter
 import re
 
+from src.identity import normalize_display
 from src.preprocess.models import CleanedPost, ExcludedRegion, RawLine, Segment, SplitResult
 
 _MARKER = re.compile(r'^[ \t]*#(?P<number>[0-9]+)(?=$|[ \t]|[:.\-–—])[ \t]*(?P<body>.*)$')
@@ -39,7 +40,11 @@ def split_confessions(cleaned: CleanedPost, *, short_content_chars: int = 10) ->
         nonlocal number, empty_segments
         if number is None:
             return
-        body = '\n'.join(line.text for line in buffer).strip()
+        raw_body = '\n'.join(line.text for line in buffer)
+        # Removing a marker can expose leading BOMs that were internal in raw.
+        # Strip the leading BOM/whitespace run in one pass, including alternating
+        # BOMs and spaces, then apply the shared display normalization to the body.
+        body = normalize_display(re.sub(r'^[\s\ufeff]+', '', raw_body)).strip()
         end_line = next((line.line_no for line in reversed(buffer) if line.text.strip()), start_line)
         if not body:
             excluded.append(region(start_line, end_line, 'EMPTY_SEGMENT'))

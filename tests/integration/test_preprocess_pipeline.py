@@ -261,3 +261,20 @@ def test_missing_input_error_codes(service, raw_dataset, missing, code):
     with pytest.raises(AppError) as error:
         service.preprocess(config)
     assert error.value.code == code
+
+
+@pytest.mark.parametrize('prefix', ['\ufeff', '\ufeff \ufeff\t\ufeff'])
+def test_body_normalization_after_marker_keeps_valid_raw_processable(service, raw_dataset, prefix):
+    config = raw_dataset([f'#1 {prefix}Copied text\n#2 Copied text\n#3 {prefix}\n#4 {prefix}123456789'])
+    before = config.paths.raw_csv.read_bytes()
+    summary = service.preprocess(config)
+    confessions = rows(config.paths.processed_dir / 'confessions.csv')
+    sources = rows(config.paths.processed_dir / 'sources.csv')
+    audit = rows(config.paths.processed_dir / 'excluded.csv')
+    assert [(r['content'], r['confession_number']) for r in confessions] == [('Copied text', '1'), ('123456789', '4')]
+    assert [(r['marker'], r['start_line'], r['end_line'], r['flags']) for r in sources] == [
+        ('1', '1', '1', ''), ('2', '2', '2', ''), ('4', '4', '4', 'SHORT_CONTENT')]
+    assert [(r['reason'], r['start_line'], r['end_line']) for r in audit] == [('EMPTY_SEGMENT', '3', '3')]
+    assert summary.published and summary.stats.empty_segments == 1 and summary.stats.duplicate_confessions == 1
+    assert config.paths.raw_csv.read_bytes() == before
+    validate_generation(config.paths.processed_dir)
