@@ -64,6 +64,21 @@ def test_label_csv_round_trip_preserves_unicode_and_exact_booleans():
     assert LabeledRecord.from_csv_row(plain.to_csv_row()) == plain
 
 
+@pytest.mark.parametrize('surrogate', ['\ud800', '\udfff'])
+@pytest.mark.parametrize('model,values', [(ModelPrediction, prediction), (LabeledRecord, label_values)])
+def test_prediction_and_persisted_reason_reject_unpaired_surrogates(surrogate, model, values):
+    with pytest.raises(ValidationError):
+        model(**values(reason='Invalid ' + surrogate))
+
+
+def test_label_reason_preserves_non_bmp_unicode_for_utf8_csv():
+    reason = 'Cơ sở vật chất tốt. \U0001f642'
+    record = LabeledRecord(**label_values(reason=reason))
+    row = record.to_csv_row()
+    assert row['reason'].encode('utf-8') == reason.encode('utf-8')
+    assert LabeledRecord.from_csv_row(row).reason == reason
+
+
 @pytest.mark.parametrize('changes', [
     {'id': 'cfs_' + '0' * 64}, {'content': ' unnormalized '},
     {'content': ''}, {'review_reasons': ('UNKNOWN',)},

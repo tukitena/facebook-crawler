@@ -92,6 +92,8 @@ class OllamaClient:
     def _request(self, method: str, path: str, **kwargs):
         try:
             response = self._client.request(method, path, **kwargs)
+        except httpx.DecodingError:
+            raise _validation_error() from None
         except httpx.TransportError:
             raise ModelAttemptError('MODEL_SERVICE_ERROR', 'Cannot communicate with local Ollama.',
                                     retryable=True, service_failure=True) from None

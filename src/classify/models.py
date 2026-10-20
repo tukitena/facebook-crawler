@@ -33,6 +33,10 @@ class PredictionFields(StrictRecord):
         reason = reason.strip()
         if not 1 <= len(reason) <= 300:
             raise ValueError('Reason must contain 1 to 300 characters after stripping')
+        try:
+            reason.encode('utf-8')
+        except UnicodeEncodeError:
+            raise ValueError('Reason must be valid UTF-8 text') from None
         return reason
 
 

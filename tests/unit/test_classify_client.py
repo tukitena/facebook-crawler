@@ -135,6 +135,39 @@ def test_error_envelope_is_fatal_without_raw_error():
     assert caught.value.exit_code == 1 and 'PRIVATE' not in str(caught.value)
 
 
+@pytest.mark.parametrize('surrogate', ['\ud800', '\udfff'])
+def test_escaped_unpaired_surrogate_is_retryable_validation_error(surrogate):
+    content = json.dumps(PREDICTION | {'reason': 'PRIVATE' + surrogate})
+    with client_for(lambda _: httpx.Response(200, json=chat_response(content=content))) as client:
+        with pytest.raises(ModelAttemptError) as caught:
+            client.classify_once('synthetic')
+    assert caught.value.code == 'MODEL_INVALID_OUTPUT'
+    assert caught.value.retryable and not caught.value.service_failure
+    assert 'PRIVATE' not in str(caught.value)
+
+
+def test_valid_escaped_non_bmp_unicode_remains_utf8_encodable():
+    content = json.dumps(PREDICTION | {'reason': 'Chuyện cá nhân. \U0001f642'})
+    with client_for(lambda _: httpx.Response(200, json=chat_response(content=content))) as client:
+        result = client.classify_once('synthetic')
+    assert result.reason.encode('utf-8') == 'Chuyện cá nhân. \U0001f642'.encode('utf-8')
+
+
+def test_malformed_http_compression_is_safe_retryable_validation_error():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, headers={'Content-Encoding': 'gzip'}, content=b'PRIVATE broken gzip')
+
+    with client_for(handler) as client, pytest.raises(ModelAttemptError) as caught:
+        client.classify_once('synthetic')
+    assert len(requests) == 1
+    assert caught.value.code == 'MODEL_INVALID_OUTPUT'
+    assert caught.value.retryable and not caught.value.service_failure
+    assert caught.value.__suppress_context__ and 'PRIVATE' not in str(caught.value)
+
+
 @pytest.mark.parametrize('header,want', [('9999', 60), ('0', 0), ('-5', None), ('NaN', None),
                                        ('1.5', None), ('nonsense', None)])
 def test_retry_after_seconds_are_bounded(header, want):
