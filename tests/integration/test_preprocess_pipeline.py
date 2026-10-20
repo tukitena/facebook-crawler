@@ -278,3 +278,14 @@ def test_body_normalization_after_marker_keeps_valid_raw_processable(service, ra
     assert summary.published and summary.stats.empty_segments == 1 and summary.stats.duplicate_confessions == 1
     assert config.paths.raw_csv.read_bytes() == before
     validate_generation(config.paths.processed_dir)
+
+
+def test_linked_footer_removal_restores_content_dedup_and_versions_generation(service, raw_dataset):
+    config = raw_dataset(['#001 Nội dung tổng hợp\n#UITconfessions: bit.ly/UITConfessions See less', '#2 Nội dung tổng hợp'])
+    result = service.preprocess(config)
+    assert [(r['content'], r['confession_number']) for r in rows(config.paths.processed_dir / 'confessions.csv')] == [
+        ('Nội dung tổng hợp', '001')]
+    assert (result.stats.sources, result.stats.duplicate_confessions, result.stats.footers_removed) == (2, 1, 1)
+    assert [(r['reason'], r['start_line'], r['end_line']) for r in rows(config.paths.processed_dir / 'excluded.csv')] == [
+        ('UI_CONTROL', '2', '2'), ('POST_FOOTER', '2', '2')]
+    assert validate_generation(config.paths.processed_dir).splitter_version == 'line_start_numeric_v3'

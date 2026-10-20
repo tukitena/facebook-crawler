@@ -59,7 +59,7 @@ def generation_case():
                 effective_config_sha256=hashlib.sha256(json.dumps(effective, ensure_ascii=False, sort_keys=True,
                                                                  separators=(',', ':')).encode()).hexdigest(),
                 overrides_sha256=None, normalization_version='v1', filter_version='preprocess_filter_v1',
-                splitter_version='line_start_numeric_v2', confession_fields=('id', 'content', 'confession_number'),
+                splitter_version='line_start_numeric_v3', confession_fields=('id', 'content', 'confession_number'),
                 outputs=outputs, counts=asdict(stats), excluded_by_reason={})
             yield writer, manifest
     return create
@@ -194,6 +194,19 @@ def test_non_semantic_manifest_changes_do_not_conflict(raw_dataset, generation_c
     outputs['excluded.csv'] = outputs['excluded.csv'].model_copy(update={'sha256': '0' * 64})
     proposed = old.model_copy(update={'generation_id': str(uuid.uuid4()), 'created_at': '2026-10-21T00:00:00Z', 'outputs': outputs})
     module.assert_no_derived_conflict(config.paths.processed_dir, config.paths.labeled_dir, proposed)
+
+
+def test_previous_splitter_generation_requires_rebuild(raw_dataset, generation_case):
+    config = raw_dataset([])
+    publish(config, generation_case)
+    path = config.paths.processed_dir / 'preprocess.manifest.json'
+    payload = json.loads(path.read_text(encoding='utf-8'))
+    payload['splitter_version'] = 'line_start_numeric_v2'
+    path.write_text(json.dumps(payload), encoding='utf-8')
+    module = import_module('src.preprocess.storage')
+    with pytest.raises(AppError) as error:
+        module.validate_generation(config.paths.processed_dir)
+    assert error.value.code == 'INVALID_GENERATION'
 
 
 @pytest.mark.parametrize('condition', ['missing', 'zero_byte', 'header_only'])

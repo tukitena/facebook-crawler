@@ -25,6 +25,8 @@ CSV dùng UTF-8 BOM. Khi nhập CSV vào bảng tính, chọn kiểu **Text** ch
 
 Marker phải ở đầu dòng, dạng `#001`, `#1 Nội dung` hoặc `#1: Nội dung`. Hashtag chữ và marker giữa câu không mở confession. Dòng chỉ gồm từ hai dấu `-` trở lên kết thúc đoạn. Footer `#UITconfessions` (có thể có `:`) và nhãn `See less`/`Ẩn bớt` chỉ được gỡ ở cuối bài. Các quy tắc có phân biệt hoa/thường; bài không có marker được ghi `NO_MARKER`.
 
+Phiên bản `line_start_numeric_v3` còn gỡ đúng dòng cuối `#UITconfessions: bit.ly/UITConfessions` sau khi gỡ nhãn UI. Dòng này phải đứng riêng và khớp chính xác; link khác hoặc cụm từ nằm trong câu được giữ. Output phiên bản cũ cần chạy lại preprocess; bộ nhãn gắn với generation cũ vẫn chịu kiểm tra conflict.
+
 Cờ trong sources: `SHORT_CONTENT` giữ đoạn ngắn để xem lại; `REPEATED_MARKER` cho number lặp trong cùng bài; `MANUAL_ACCEPT` cho bài nhận theo override. Các cờ không tự loại nội dung. Dòng nguồn tính từ 1 trong raw.
 
 ## Điều chỉnh bộ lọc

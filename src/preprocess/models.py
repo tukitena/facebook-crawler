@@ -179,7 +179,7 @@ class PreprocessSummary:
 
 MANIFEST_SCHEMA_VERSION = 1
 FILTER_VERSION = 'preprocess_filter_v1'
-SPLITTER_VERSION = 'line_start_numeric_v2'
+SPLITTER_VERSION = 'line_start_numeric_v3'
 SHA256 = Annotated[str, Field(strict=True, pattern=r'^[0-9a-f]{64}$')]
 Count = Annotated[int, Field(strict=True, ge=0)]
 

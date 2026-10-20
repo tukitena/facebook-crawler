@@ -50,3 +50,35 @@ def test_cleanup_same_line_and_empty_segment():
     empty = splitter.split_confessions(cleanup.cleanup_tail('#1\n#UITconfessions\nẨn bớt'))
     assert empty.segments == () and empty.empty_segments == 1
     assert [(r.reason, r.start_line, r.end_line) for r in empty.excluded] == [('EMPTY_SEGMENT', 1, 1)]
+
+
+@pytest.mark.parametrize('ui', ['', ' See less', '\nẨn bớt'])
+def test_exact_terminal_linked_footer(ui):
+    cleanup = import_module('src.preprocess.cleanup')
+    splitter = import_module('src.preprocess.splitter')
+    footer = '#UITconfessions: bit.ly/UITConfessions'
+    raw = '#001 Nội dung tổng hợp\n' + footer + ui
+    result = cleanup.cleanup_tail(raw)
+    assert result.raw_content == raw
+    assert [(r.reason, r.start_line, r.end_line, r.excerpt) for r in result.removed if r.reason == 'POST_FOOTER'] == [
+        ('POST_FOOTER', 2, 2, footer)]
+    segment = splitter.split_confessions(result).segments[0]
+    assert (segment.content, segment.start_line, segment.end_line) == ('Nội dung tổng hợp', 1, 1)
+    empty = splitter.split_confessions(cleanup.cleanup_tail('#1\n' + footer + ui))
+    assert not empty.segments and empty.empty_segments == 1
+
+
+@pytest.mark.parametrize('body', [
+    'Nhắc tới #UITconfessions: bit.ly/UITConfessions',
+    '#UITconfessions: bit.ly/UITConfessions\nCòn nội dung',
+    '"#UITconfessions: bit.ly/UITConfessions"',
+    '#UITconfessions: bit.ly/UITConfessions/other',
+    '#UITconfessions: https://bit.ly/UITConfessions',
+    '#UITConfessions: bit.ly/UITConfessions',
+    '#UITconfessions: bit.ly/OtherForm',
+])
+def test_linked_footer_cleanup_does_not_expand_to_other_text(body):
+    cleanup = import_module('src.preprocess.cleanup')
+    raw = '#1 Nội dung\n' + body
+    cleaned = cleanup.cleanup_tail(raw)
+    assert '\n'.join(line.text for line in cleaned.lines) == raw and not cleaned.removed
