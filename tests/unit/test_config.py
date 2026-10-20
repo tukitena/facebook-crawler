@@ -63,3 +63,46 @@ classification: {review_threshold: 0.70}
 def test_missing_config_has_actionable_error(tmp_path):
     with pytest.raises(AppError, match='config.example.yaml'):
         load_config(tmp_path / 'missing.yaml')
+
+
+@pytest.mark.parametrize('text', [
+    'ollama: {seed: true}', 'ollama: {seed: "42"}',
+    'ollama: {think: "false"}', 'ollama: {think: 0}',
+    'ollama: {temperature: true}', 'classification: {review_threshold: true}',
+])
+def test_classification_config_rejects_coerced_scalars(tmp_path, text):
+    with pytest.raises(AppError) as error:
+        load_config(write_config(tmp_path, text))
+    assert error.value.code == 'CONFIG_ERROR'
+
+
+@pytest.mark.parametrize('url', [
+    'http://localhost', 'https://localhost:11434/',
+    'http://127.0.0.1:11434', 'https://[::1]:11434',
+])
+def test_classify_accepts_loopback_ollama_endpoint(url):
+    from src.config import validate_ollama_base_url
+    assert validate_ollama_base_url(url) == url.rstrip('/')
+
+
+@pytest.mark.parametrize('url', [
+    'localhost:11434', 'ftp://localhost', 'http://remote.test',
+    'http://127.0.0.2', 'http://localhost.evil.test', 'http://user@localhost',
+    'http://user:secret@localhost', 'http://localhost?', 'http://localhost#',
+    'http://localhost?next=remote', 'http://localhost#fragment',
+    'http://localhost/api', 'http://localhost:bad', 'http://localhost:65536',
+    'http://localhost:0', 'http://[::1', ' http://localhost',
+    'http://local\nhost', 'http://localhost\\@remote.test',
+    'http://localhost:', 'http://[::1]:', 'http://[::1]evil:11434',
+])
+def test_classify_rejects_invalid_or_remote_ollama_endpoint(url):
+    from src.config import validate_ollama_base_url
+    with pytest.raises(AppError) as error:
+        validate_ollama_base_url(url)
+    assert error.value.code == 'CONFIG_ERROR'
+    assert error.value.exit_code == 2
+
+
+def test_offline_config_loading_does_not_validate_ollama_endpoint(tmp_path):
+    config = load_config(write_config(tmp_path, 'ollama: {base_url: "http://remote.test"}'))
+    assert config.ollama.base_url == 'http://remote.test'

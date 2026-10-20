@@ -1,6 +1,7 @@
 """Load the shared design schema; runtime dependencies are checked by each command."""
 
 import os
+import re
 from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import parse_qs, urlsplit
@@ -84,11 +85,11 @@ class PreprocessConfig(Schema):
 class OllamaConfig(Schema):
     base_url: str = 'http://127.0.0.1:11434'
     model: str = 'qwen3:8b'
-    temperature: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0
-    seed: int = 42
+    temperature: Annotated[float, Field(strict=True, ge=0, allow_inf_nan=False)] = 0
+    seed: Annotated[int, Field(strict=True)] = 42
     num_ctx: PositiveInt = 8192
     num_predict: PositiveInt = 512
-    think: bool = False
+    think: bool = Field(default=False, strict=True)
     keep_alive: str = '5m'
     connect_timeout_seconds: PositiveFloat = 5
     read_timeout_seconds: PositiveFloat = 120
@@ -99,7 +100,7 @@ class OllamaConfig(Schema):
 class ClassificationConfig(Schema):
     prompt_path: Path = Path('src/classify/prompts/uit-impact-v1.txt')
     max_attempts: PositiveInt = 3
-    review_threshold: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)] = 0.70
+    review_threshold: Annotated[float, Field(strict=True, ge=0, le=1, allow_inf_nan=False)] = 0.70
     max_content_utf8_bytes: PositiveInt = 6000
     context_margin: PositiveInt = 1024
     consecutive_service_failures: PositiveInt = 3
@@ -109,6 +110,23 @@ class LoggingConfig(Schema):
     level: Literal['DEBUG', 'INFO', 'WARNING', 'ERROR'] = 'INFO'
     max_bytes: PositiveInt = 10485760
     backup_count: PositiveInt = 3
+
+
+def validate_ollama_base_url(value: str) -> str:
+    """Validate at the classify boundary, without affecting offline commands."""
+    try:
+        if (not isinstance(value, str) or any(char.isspace() or ord(char) < 32 for char in value)
+                or any(char in value for char in ('?', '#', '\\'))):
+            raise ValueError('Invalid endpoint characters')
+        url = urlsplit(value)
+        if (url.scheme not in {'http', 'https'} or url.hostname not in {'localhost', '127.0.0.1', '::1'}
+                or re.fullmatch(r'(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?', url.netloc.lower()) is None
+                or url.username is not None or url.password is not None or url.path not in {'', '/'}
+                or (url.port is not None and not 1 <= url.port <= 65535)):
+            raise ValueError('Invalid loopback endpoint')
+        return value.rstrip('/')
+    except (TypeError, ValueError) as exc:
+        raise AppError('CONFIG_ERROR', 'Ollama URL must be an HTTP(S) loopback endpoint without credentials, query or fragment.', 2) from exc
 
 
 class AppConfig(Schema):
