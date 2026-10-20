@@ -1,0 +1,3 @@
+# Includes runtime dependencies and the offline test runner.
+-r requirements.txt
+pytest>=9.1.1,<10.0

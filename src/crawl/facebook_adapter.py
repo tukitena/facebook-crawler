@@ -1,0 +1,263 @@
+"""Conservative DOM boundary for Facebook. Selectors require live-page smoke tests.
+
+Unknown layouts fail visibly; never fall back to extracting the whole page/article.
+"""
+
+import hashlib
+import re
+import time
+from collections.abc import Iterator
+from urllib.parse import parse_qs, urlencode, urljoin, urlsplit, urlunsplit
+
+from playwright.sync_api import Error as PlaywrightError, Page, TimeoutError as PlaywrightTimeout
+
+from src.config import AppConfig
+from src.errors import AppError
+from src.identity import normalize_display
+from src.models import ExtractedPost, ExtractionResult, FeedProgress, PostKind, SessionState
+
+ADAPTER_VERSION = 'facebook_dom_v2'
+MESSAGE = '[data-ad-preview="message"], [data-ad-rendering-role="story_message"], [data-testid="post_message"]'
+HEADER = '[data-ad-rendering-role="story_header"], h2, h3'
+POSITIONED_POST = '[aria-posinset]:has([data-virtualized])'
+POST_BOUNDARY = f'[role="article"], {POSITIONED_POST}'
+ARTICLE = f'[role="feed"] [role="article"], [role="main"] {POSITIONED_POST}:has({HEADER}, {MESSAGE})'
+MORE = {'see more', 'xem thêm'}
+ACCOUNT = re.compile(r'^(Your profile|Your account|Account|Trang cá nhân của bạn|Tài khoản của bạn|Tài khoản)$', re.I)
+
+# One ownership rule for both extraction and the final atomic text read. A
+# message may carry a chain of nested markers; branching markers remain ambiguous.
+OWNED_NODES = '''(article, args) => {
+    const nodes = Array.from(article.querySelectorAll(args.selector)).filter(
+        e => e.closest(args.boundary) === article && !e.closest('blockquote'));
+    if (!args.message) return nodes;
+    const leaves = nodes.filter(e => !nodes.some(other => other !== e && e.contains(other)));
+    if (leaves.length > 1) return leaves;
+    return nodes.filter(e => !nodes.some(other => other !== e && other.contains(e)));
+}'''
+
+
+def _facebook_url(value: str):
+    try:
+        url = urlsplit(urljoin('https://www.facebook.com/', value))
+        if (url.scheme != 'https' or url.hostname not in {'facebook.com', 'www.facebook.com'}
+                or url.username or url.password or url.port not in {None, 443}):
+            return None
+        return url
+    except ValueError:
+        return None
+
+
+def page_identity(value: str) -> str | None:
+    url = _facebook_url(value)
+    if url is None:
+        return None
+    path = url.path.strip('/')
+    if path == 'profile.php':
+        ident = parse_qs(url.query).get('id', [''])[0]
+        return f'id:{ident}' if ident.isdigit() else None
+    if path and '/' not in path and '.' not in path:
+        return path.casefold()
+    return None
+
+
+def post_permalink(value: str) -> str:
+    url = _facebook_url(value)
+    if url is None:
+        return ''
+    if re.fullmatch(r'/[^/]+/posts/[^/]+/?', url.path):
+        return urlunsplit(('https', 'www.facebook.com', url.path.rstrip('/'), '', ''))
+    if url.path in {'/story.php', '/permalink.php'}:
+        query = parse_qs(url.query)
+        if query.get('story_fbid') and query.get('id'):
+            params = {key: query[key][0] for key in ('story_fbid', 'id')}
+            return urlunsplit(('https', 'www.facebook.com', url.path, urlencode(params), ''))
+    return ''
+
+
+class FacebookAdapter:
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self.identity = page_identity(config.facebook.page_url)
+        if not self.identity:
+            raise AppError('CONFIG_ERROR', 'URL page chưa được adapter hỗ trợ; dùng URL tên page hoặc profile.php?id=...', 2)
+
+    def check_session(self, page: Page) -> SessionState:
+        url = urlsplit(page.url)
+        if any(part in url.path for part in ('/checkpoint', '/two_step_verification', '/challenge')):
+            return SessionState.CHECKPOINT
+        if page.locator('form[action*="checkpoint"], input[name="approvals_code"]').count():
+            return SessionState.CHECKPOINT
+        if '/login' in url.path or page.locator('input[name="pass"]:visible').count():
+            return SessionState.LOGIN_REQUIRED
+        current_identity = page_identity(page.url)
+        if not current_identity or current_identity != self.identity:
+            return SessionState.UNKNOWN
+        headings = page.get_by_role('heading', name=self.config.facebook.page_name, exact=True)
+        has_heading = any(headings.nth(i).is_visible() and not headings.nth(i).evaluate(
+            '(e, boundary) => Boolean(e.closest(boundary))', POST_BOUNDARY)
+            for i in range(headings.count()))
+        account = page.get_by_role('button', name=ACCOUNT)
+        has_account = any(account.nth(i).is_visible() for i in range(account.count()))
+        if has_heading and has_account and (page.locator('[role="feed"]').count() or self._articles(page)):
+            return SessionState.AUTHENTICATED
+        return SessionState.UNKNOWN
+
+    def _articles(self, page):
+        return [node for node in page.locator(ARTICLE).element_handles()
+                if node.evaluate('(e, boundary) => !e.parentElement.closest(boundary)', POST_BOUNDARY)]
+
+    def _owned(self, article, selector):
+        nodes = article.evaluate_handle(OWNED_NODES, {
+            'selector': selector, 'boundary': POST_BOUNDARY, 'message': selector == MESSAGE,
+        })
+        try:
+            return [element for handle in nodes.get_properties().values()
+                    if (element := handle.as_element()) is not None]
+        finally:
+            nodes.dispose()
+
+    def _details(self, article):
+        headers = self._owned(article, HEADER)
+        if not headers:
+            return None
+        header = headers[0]
+        authors = header.query_selector_all('a[href]')
+        if not authors:
+            return None
+        author = authors[0]
+        identity = page_identity(author.get_attribute('href') or '')
+        name = normalize_display(author.inner_text())
+        action = normalize_display(header.inner_text()).removeprefix(name).strip().casefold()
+        kind = PostKind.UNKNOWN
+        if re.search(r'updated (?:their|his|her|its) profile picture|đã cập nhật ảnh đại diện', action):
+            kind = PostKind.PROFILE_UPDATE
+        elif re.search(r'updated (?:their|his|her|its) cover photo|đã cập nhật ảnh bìa', action):
+            kind = PostKind.COVER_UPDATE
+        elif re.search(r'shared (?:a|an|the)|đã chia sẻ', action):
+            kind = PostKind.SHARED
+        elif not action:
+            kind = PostKind.TEXT
+        messages = self._owned(article, MESSAGE)
+        links = self._owned(article, 'a[href]')
+        # Links inside message text are data, not evidence of a source permalink.
+        permalinks = [post_permalink(link.get_attribute('href') or '') for link in links
+                      if not link.evaluate('(e, selector) => Boolean(e.closest(selector))', MESSAGE)]
+        permalink = next((value for value in permalinks if value), '')
+        message = messages[0] if len(messages) == 1 else None
+        signature_text = (message.inner_text() if message else '') + '\n' + action
+        signature = permalink or 'dom_' + hashlib.sha256(signature_text.encode('utf-8')).hexdigest()
+        return identity, kind, message, signature, permalink, len(messages)
+
+    def visible_signatures(self, page: Page) -> frozenset[str]:
+        signatures = set()
+        for article in self._articles(page):
+            try:
+                details = self._details(article)
+                if details and details[0] == self.identity:
+                    signatures.add(details[3])
+            except PlaywrightError:
+                if page.is_closed():
+                    raise
+        return frozenset(signatures)
+
+    @staticmethod
+    def _message_snapshot(body):
+        return body.evaluate('''body => ({
+            connected: body.isConnected,
+            text: body.innerText,
+            collapsed: Array.from(body.querySelectorAll('button, [role="button"]')).some(
+                e => ['see more', 'xem thêm'].includes(e.innerText.trim().toLowerCase())),
+            busy: Boolean(body.closest('[aria-busy="true"]') || body.querySelector('[aria-busy="true"], [role="progressbar"]'))
+        })''')
+
+    def _expand(self, page, body, control) -> str:
+        # Removing the control alone is not evidence that the delayed text arrived.
+        # Labels are removed only from the comparison; stored content stays intact.
+        def comparison(text):
+            return ' '.join(re.sub(r'see more|xem thêm', '', text, flags=re.I).split())
+
+        before = comparison(body.inner_text())
+        timeout = self.config.crawl.action_timeout_seconds
+        deadline = time.monotonic() + timeout
+        quiet_seconds = min(0.25, timeout / 3)
+        control.click(timeout=timeout * 1000)
+        candidate = None
+        stable_since = time.monotonic()
+        while time.monotonic() < deadline:
+            snapshot = self._message_snapshot(body)
+            if not snapshot['connected']:
+                raise PlaywrightTimeout('Message detached during expansion')
+            text = normalize_display(snapshot['text'])
+            ready = not snapshot['collapsed'] and not snapshot['busy'] and comparison(text) != before
+            if not ready or text != candidate:
+                candidate = text if ready else None
+                stable_since = time.monotonic()
+            elif time.monotonic() - stable_since >= quiet_seconds:
+                return text
+            page.wait_for_timeout(min(25, max(1, (deadline - time.monotonic()) * 1000)))
+        raise PlaywrightTimeout('Expansion did not produce settled full text')
+
+    def extract_visible_posts(self, page: Page) -> Iterator[ExtractionResult]:
+        articles = self._articles(page)
+        if not articles:
+            yield ExtractionResult('layout:no_articles', error_code='UNSUPPORTED_LAYOUT')
+            return
+        for article in articles:
+            signature = 'layout:unrecognized'
+            try:
+                details = self._details(article)
+                if details is None:
+                    yield ExtractionResult(signature, error_code='UNKNOWN_AUTHOR')
+                    continue
+                identity, kind, body, signature, permalink, message_count = details
+                if not identity:
+                    yield ExtractionResult(signature, error_code='UNKNOWN_AUTHOR')
+                    continue
+                if identity != self.identity:
+                    continue
+                if message_count > 1:
+                    yield ExtractionResult(signature, error_code='AMBIGUOUS_MESSAGE')
+                    continue
+                if body is None:
+                    # An avatar or attachment does not prove a caption is absent.
+                    yield ExtractionResult(signature, error_code='UNSUPPORTED_LAYOUT')
+                    continue
+                controls = [node for node in body.query_selector_all('button, [role="button"]')
+                            if node.inner_text().strip().casefold() in MORE]
+                expanded_text = self._expand(page, body, controls[0]) if controls else None
+                if not body.evaluate('(e) => e.isConnected'):
+                    raise PlaywrightTimeout('Message detached')
+                after = self._details(article)
+                if not after or after[0] != identity or after[4] != permalink or after[5] != 1:
+                    raise PlaywrightTimeout('Article changed during extraction')
+                # Revalidate ownership and read text in the same browser task.
+                text = normalize_display(body.evaluate('''(body, args) => {
+                    const owned = (''' + OWNED_NODES + ''')(args.article, args);
+                    if (!body.isConnected || owned.length !== 1 || owned[0] !== body)
+                        throw new Error('Message changed during extraction');
+                    return body.innerText;
+                }''', {'article': article, 'selector': MESSAGE, 'boundary': POST_BOUNDARY, 'message': True}))
+                if expanded_text is not None and text != expanded_text:
+                    raise PlaywrightTimeout('Expanded message changed before extraction')
+                if text:
+                    yield ExtractionResult(signature, ExtractedPost(text, permalink, kind))
+                else:
+                    yield ExtractionResult(signature)
+            except PlaywrightError:
+                if page.is_closed():
+                    raise
+                yield ExtractionResult(signature, error_code='INCOMPLETE_CONTENT')
+
+    def scroll_and_wait(self, page: Page) -> FeedProgress:
+        before = self.visible_signatures(page)
+        page.evaluate('window.scrollBy(0, Math.max(600, window.innerHeight * 0.85))')
+        page.wait_for_timeout(self.config.crawl.scroll_delay_seconds * 1000)
+        deadline = time.monotonic() + self.config.crawl.feed_wait_timeout_seconds
+        while True:
+            signatures = self.visible_signatures(page)
+            if signatures != before or time.monotonic() >= deadline:
+                return FeedProgress(signatures)
+            if self.check_session(page) != SessionState.AUTHENTICATED:
+                return FeedProgress(signatures)
+            page.wait_for_timeout(min(250, max(1, (deadline - time.monotonic()) * 1000)))

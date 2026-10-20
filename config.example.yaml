@@ -1,0 +1,36 @@
+schema_version: 1
+
+facebook:
+  page_name: "UIT Confessions"
+  page_url: "https://www.facebook.com/UITconfess"
+
+chrome:
+  executable_path: null # Auto-discover installed Google Chrome.
+  user_data_dir: "runtime/chrome-profile" # Dedicated local profile only.
+  headless: false
+  login_attempts: 3
+
+# Paths are relative to this config file, not the terminal directory.
+paths:
+  data_dir: "data/uit"
+  raw_csv: "data/uit/raw/raw_posts.csv"
+  processed_dir: "data/uit/processed"
+  labeled_dir: "data/uit/labeled"
+  reports_dir: "data/uit/reports"
+  log_dir: "logs"
+
+crawl:
+  max_posts: 200 # Newly committed raw posts in this run.
+  max_scrolls: 200
+  no_progress_rounds: 8
+  scroll_delay_seconds: 2
+  feed_wait_timeout_seconds: 10
+  navigation_timeout_seconds: 30
+  action_timeout_seconds: 10
+  blocked_resource_types: ["image", "media", "font"]
+  service_workers: "block"
+
+logging:
+  level: "INFO"
+  max_bytes: 10485760
+  backup_count: 3

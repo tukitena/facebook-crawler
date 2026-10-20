@@ -1,0 +1,7 @@
+# Runtime dependencies. Install with: python -m pip install -r requirements.txt
+# Initial version ranges; freeze exact versions after integration smoke tests.
+playwright>=1.64.0,<2.0
+httpx>=0.28.1,<0.29
+pydantic>=2.14.1,<3.0
+PyYAML>=6.0.3,<7.0
+portalocker>=4.4.1,<5.0
