@@ -106,3 +106,16 @@ def test_classify_rejects_invalid_or_remote_ollama_endpoint(url):
 def test_offline_config_loading_does_not_validate_ollama_endpoint(tmp_path):
     config = load_config(write_config(tmp_path, 'ollama: {base_url: "http://remote.test"}'))
     assert config.ollama.base_url == 'http://remote.test'
+
+
+@pytest.mark.parametrize('attempts', ['0', '4', 'true', '"2"', '1.5'])
+def test_classification_attempts_reject_out_of_budget_values(tmp_path, attempts):
+    with pytest.raises(AppError) as error:
+        load_config(write_config(tmp_path, f'classification: {{max_attempts: {attempts}}}'))
+    assert error.value.code == 'CONFIG_ERROR'
+
+
+@pytest.mark.parametrize('attempts', [1, 2, 3])
+def test_classification_attempts_allow_one_to_three(tmp_path, attempts):
+    config = load_config(write_config(tmp_path, f'classification: {{max_attempts: {attempts}}}'))
+    assert config.classification.max_attempts == attempts

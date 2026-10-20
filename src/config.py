@@ -99,7 +99,7 @@ class OllamaConfig(Schema):
 
 class ClassificationConfig(Schema):
     prompt_path: Path = Path('src/classify/prompts/uit-impact-v1.txt')
-    max_attempts: PositiveInt = 3
+    max_attempts: Annotated[int, Field(strict=True, ge=1, le=3)] = 3
     review_threshold: Annotated[float, Field(strict=True, ge=0, le=1, allow_inf_nan=False)] = 0.70
     max_content_utf8_bytes: PositiveInt = 6000
     context_margin: PositiveInt = 1024
