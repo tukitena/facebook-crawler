@@ -225,6 +225,7 @@ def test_report_failure_after_publish_keeps_generation(service, raw_dataset, mon
 
 
 def test_report_failure_does_not_mask_primary_error(service, raw_dataset, monkeypatch, caplog):
+    monkeypatch.setattr(service.logger, 'propagate', True)
     config = raw_dataset(['#1 A'])
     config.paths.raw_csv.write_bytes(b'private broken body\r\n')
     def failure(*args):

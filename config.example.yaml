@@ -30,6 +30,14 @@ crawl:
   blocked_resource_types: ["image", "media", "font"]
   service_workers: "block"
 
+preprocess:
+  marker_policy: line_start_numeric_v1
+  separator_min_hyphens: 2
+  require_marker: true
+  short_content_chars: 10
+  excluded_post_patterns: []
+  overrides_csv: null
+
 logging:
   level: "INFO"
   max_bytes: 10485760

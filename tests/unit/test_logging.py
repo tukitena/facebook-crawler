@@ -1,7 +1,25 @@
 import json
+from dataclasses import asdict
 
 from src.config import load_config
 from src.logging_setup import close_logging, configure_logging
+from src.preprocess.models import PreprocessStats
+
+
+def test_preprocess_log_allows_counters_not_text(tmp_path):
+    config_path = tmp_path / 'config.yaml'
+    config_path.write_text('{}')
+    config = load_config(config_path)
+    logger = configure_logging(config, 'preprocess-test', 'preprocess')
+    counters = {name: i for i, name in enumerate(asdict(PreprocessStats()), 1)}
+    logger.info('private-body', extra={'event': 'run_finished', **counters,
+                                     'content': 'private-body', 'excerpt': 'private-excerpt', 'note': 'private-note'})
+    close_logging()
+    text = (config.paths.log_dir / 'crawl.jsonl').read_text(encoding='utf-8')
+    record = json.loads(text)
+    assert record['command'] == 'preprocess'
+    assert all(record.get(name) == value for name, value in counters.items())
+    assert 'private' not in text
 
 
 def test_json_log_contains_safe_fields_only(tmp_path):

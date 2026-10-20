@@ -11,6 +11,9 @@ from src.crawl.service import crawl
 from src.errors import AppError
 from src.logging_setup import close_logging, configure_logging
 from src.models import CrawlStats
+from src.preprocess.models import PreprocessStats
+from src.preprocess.service import preprocess
+from src.preprocess.storage import validate_preprocess_paths
 from src.reset import reset_dataset, validate_reset_paths
 
 
@@ -21,6 +24,20 @@ class ConsoleProgress:
         self.last = float('-inf')
 
     def __call__(self, stats: CrawlStats, *, force=False):
+        now = self.clock()
+        if force or now - self.last >= 1:
+            fields = ' '.join(f'{key}={value}' for key, value in asdict(stats).items())
+            print(f'{fields} elapsed={now - self.started:.1f}s', file=sys.stderr)
+            self.last = now
+
+
+class PreprocessConsoleProgress:
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.started = clock()
+        self.last = float('-inf')
+
+    def __call__(self, stats: PreprocessStats, *, force: bool = False) -> None:
         now = self.clock()
         if force or now - self.last >= 1:
             fields = ' '.join(f'{key}={value}' for key, value in asdict(stats).items())
@@ -43,6 +60,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     commands.add_parser('reset', help='Xóa raw, metadata và output dẫn xuất; giữ profile, config, log và report.',
                         description='Xóa lịch sử/output của dataset theo config để crawl lại. '
                                     'Giữ profile đăng nhập, config, log, report và file thủ công; không tự chạy crawl.')
+    commands.add_parser('preprocess', help='Tách, làm sạch và dedup confession từ raw; chạy offline.',
+                        description='Rebuild confessions, sources và excluded từ raw; giữ nguyên raw và kiểm tra nhãn cũ.')
     args = parser.parse_args(argv)
     run_id = str(uuid.uuid4())
     try:
@@ -51,12 +70,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = load_config(args.config, overrides)
         if args.command == 'reset':
             validate_reset_paths(config, args.config)
+        elif args.command == 'preprocess':
+            validate_preprocess_paths(config, args.config)
         configure_logging(config, run_id, args.command)
         if args.command == 'reset':
             reset_dataset(config, config_path=args.config)
             print('Đã reset dữ liệu. Chạy python main.py crawl để thu thập lại '
                   '(dùng cùng --config nếu có).', file=sys.stderr)
             return 0
+        if args.command == 'preprocess':
+            progress = PreprocessConsoleProgress()
+            result = preprocess(config, progress=progress, run_id=run_id)
+            progress(result.stats, force=True)
+            print(f'preprocess: {result.status}; generation={result.generation_id}; '
+                  f'report={config.paths.reports_dir / (run_id + ".json")}', file=sys.stderr)
+            return result.exit_code
         progress = ConsoleProgress()
         result = crawl(config, progress=progress, run_id=run_id)
         progress(result.stats, force=True)
@@ -67,6 +95,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print('candidate_segments là số marker tạm đếm, chưa phải số confession đã tiền xử lý.', file=sys.stderr)
         return result.exit_code
     except KeyboardInterrupt:
+        if args.command == 'preprocess':
+            print('Đã ngắt preprocess; raw giữ nguyên. Xem report để biết generation đã publish hay chưa; '
+                  'chạy lại preprocess để rebuild. (exit 130)', file=sys.stderr)
+            return 130
         if args.command == 'reset':
             print('Đã ngắt reset; dữ liệu có thể mới xóa một phần. '
                   'Chạy lại reset để hoàn tất trước khi crawl. (exit 130)', file=sys.stderr)
@@ -78,7 +110,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return exc.exit_code
     except Exception as exc:
         # Browser exception strings can contain DOM snippets or session details.
-        print(f'RUNTIME_ERROR ({type(exc).__name__}): lệnh đã dừng; kiểm tra cấu hình, Chrome và file report.', file=sys.stderr)
+        if args.command == 'preprocess':
+            print(f'RUNTIME_ERROR ({type(exc).__name__}): preprocess đã dừng; kiểm tra cấu hình và report.', file=sys.stderr)
+        else:
+            print(f'RUNTIME_ERROR ({type(exc).__name__}): lệnh đã dừng; kiểm tra cấu hình, Chrome và file report.', file=sys.stderr)
         return 1
     finally:
         close_logging()

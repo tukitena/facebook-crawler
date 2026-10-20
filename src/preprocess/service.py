@@ -22,7 +22,7 @@ from src.preprocess.splitter import split_confessions
 from src.preprocess.storage import ProcessedWriter, file_sha256, json_sha256, validate_preprocess_paths
 from src.storage import atomic_write_json, iter_raw_posts, resource_lock
 
-logger = logging.getLogger('facebook_crawler')
+logger = logging.getLogger('crawler')
 
 
 def preprocess(config: AppConfig, *, progress: Callable[[PreprocessStats], None] | None = None,

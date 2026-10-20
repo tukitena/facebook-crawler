@@ -9,7 +9,10 @@ from src.models import utc_now
 SAFE_FIELDS = ('record_id', 'attempt', 'duration_ms', 'error_code', 'seen_posts', 'saved_posts',
                'duplicate_posts', 'candidate_segments', 'extraction_errors', 'media_only_posts',
                'scrolls', 'no_progress_rounds', 'status', 'stop_reason', 'round_index',
-               'session_ms', 'extraction_ms', 'storage_ms', 'scroll_ms')
+               'session_ms', 'extraction_ms', 'storage_ms', 'scroll_ms',
+               'read_posts', 'accepted_posts', 'excluded_posts', 'empty_segments',
+               'unique_confessions', 'duplicate_confessions', 'sources', 'excluded_regions',
+               'separators', 'ui_controls_removed', 'footers_removed')
 
 
 class JsonFormatter(logging.Formatter):
