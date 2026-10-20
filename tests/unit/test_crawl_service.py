@@ -25,7 +25,7 @@ class FakeAdapter:
     def check_session(self, page):
         return SessionState.AUTHENTICATED
 
-    def extract_visible_posts(self, page):
+    def extract_visible_posts(self, page, *, handled_ids=None):
         yield from self.screens[min(self.index, len(self.screens) - 1)]
 
     def scroll_and_wait(self, page):
@@ -115,3 +115,62 @@ def test_edited_post_same_permalink_is_saved(tmp_path):
         assert crawl_feed(None, adapter, store, config, stats, None) == ('max_posts', 0)
         assert len(store.existing) == 2
     assert stats.seen_posts == stats.saved_posts == 2
+
+
+def test_round_timings_separate_extraction_storage_scroll_and_progress(monkeypatch, caplog):
+    from src.crawl import service
+
+    clock = [0.0]
+    monkeypatch.setattr(service.time, 'perf_counter', lambda: clock[0])
+
+    class TimedAdapter(FakeAdapter):
+        def check_session(self, page):
+            clock[0] += 0.01
+            return super().check_session(page)
+
+        def extract_visible_posts(self, page, *, handled_ids=None):
+            clock[0] += 0.02
+            yield from super().extract_visible_posts(page, handled_ids=handled_ids)
+            clock[0] += 0.03
+
+        def scroll_and_wait(self, page):
+            clock[0] += 0.05
+            return super().scroll_and_wait(page)
+
+    def append(post):
+        clock[0] += 0.04
+        return True
+
+    def progress(stats):
+        clock[0] += 0.07
+
+    config = AppConfig()
+    config.crawl.max_scrolls = 1
+    store = Mock(append=Mock(side_effect=append))
+    with caplog.at_level('INFO', logger='crawler'):
+        assert crawl_feed(None, TimedAdapter([[result('#1 First')]]), store, config,
+                          CrawlStats(), progress) == ('max_scrolls', 0)
+    records = [r for r in caplog.records if getattr(r, 'event', None) == 'crawl_timing']
+    assert len(records) == 2
+    assert records[0].session_ms == pytest.approx(10)
+    assert records[0].extraction_ms == pytest.approx(50)
+    assert records[0].storage_ms == pytest.approx(40)
+    assert records[0].scroll_ms == pytest.approx(50)
+    assert records[0].duration_ms == pytest.approx(290)
+    assert records[1].extraction_ms == pytest.approx(50)
+    assert records[1].storage_ms == records[1].scroll_ms == 0
+
+
+def test_round_timings_are_emitted_on_early_stop_and_storage_failure(caplog):
+    config = AppConfig()
+    config.crawl.max_posts = 1
+    adapter = FakeAdapter([[result('#1 First')]])
+    with caplog.at_level('INFO', logger='crawler'):
+        assert crawl_feed(None, adapter, Mock(append=Mock(return_value=True)), config,
+                          CrawlStats(), None) == ('max_posts', 0)
+        with pytest.raises(AppError):
+            crawl_feed(None, adapter, Mock(append=Mock(side_effect=AppError('STORAGE_ERROR', 'disk full'))),
+                       config, CrawlStats(), None)
+    records = [r for r in caplog.records if getattr(r, 'event', None) == 'crawl_timing']
+    assert len(records) == 2
+    assert all(r.duration_ms >= r.storage_ms >= 0 for r in records)

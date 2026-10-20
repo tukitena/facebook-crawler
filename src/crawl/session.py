@@ -1,7 +1,8 @@
 import logging
-import math
 import sys
 import time
+from queue import Empty, Queue
+from threading import Thread
 
 from playwright.sync_api import BrowserContext, BrowserType, Error as PlaywrightError, Page, TimeoutError as PlaywrightTimeout
 
@@ -15,12 +16,14 @@ logger = logging.getLogger('crawler')
 LOGIN_MESSAGE = ('Hãy đăng nhập Facebook trong cửa sổ Chrome vừa mở, hoàn thành xác minh nếu có, '
                  'đóng các cửa sổ Chrome dùng profile này rồi nhấn Enter. ')
 BUSY_MESSAGE = 'Profile đang được Chrome sử dụng. Đóng các cửa sổ Chrome dùng profile này rồi nhấn Enter. '
+START_MESSAGE = ('Hãy chờ trang Facebook tải xong trong cửa sổ Chrome vừa mở. '
+                 'Khi sẵn sàng bắt đầu crawl, nhập y hoặc nhấn Enter: ')
 
 
 def navigate_with_retry(page: Page, url: str, timeout_ms: int, sleep_fn=time.sleep) -> None:
     for attempt in range(1, 4):
         try:
-            page.goto(url, wait_until='domcontentloaded', timeout=timeout_ms)
+            page.goto(url, wait_until='commit', timeout=timeout_ms)
             return
         except PlaywrightTimeout as exc:
             if attempt == 3:
@@ -45,14 +48,35 @@ class SessionManager:
         else:
             route.continue_()
 
-    def _check_ready(self, page):
-        # Re-check actual session signals while the SPA renders after DOMContentLoaded.
-        for attempt in range(max(1, math.ceil(self.config.crawl.action_timeout_seconds / 0.25))):
-            state = self.adapter.check_session(page)
-            if state != SessionState.UNKNOWN:
-                return state
-            page.wait_for_timeout(250)
-        return SessionState.UNKNOWN
+    def _confirm_start(self, page: Page) -> None:
+        if not self.is_interactive():
+            raise AppError('AUTH_REQUIRED', 'Cần xác nhận bắt đầu crawl trong terminal tương tác rồi chạy lại.', 2)
+        outcome = Queue(maxsize=1)
+
+        def read_confirmation():
+            try:
+                while True:
+                    answer = self.input_fn(START_MESSAGE)
+                    if answer.strip().casefold() in ('', 'y'):
+                        outcome.put(None)
+                        return
+            except BaseException as exc:
+                # Deliver input failures, including interruption, to the owning thread.
+                outcome.put(exc)
+
+        Thread(target=read_confirmation, daemon=True).start()
+        while True:
+            try:
+                error = outcome.get_nowait()
+            except Empty:
+                # Service routed requests while the user waits; Playwright stays on this thread.
+                page.wait_for_timeout(50)
+                continue
+            if isinstance(error, EOFError):
+                raise AppError('AUTH_REQUIRED', 'Terminal đã đóng; hãy chạy lại trong terminal tương tác.', 2) from error
+            if error is None:
+                return
+            raise error
 
     def ensure_authenticated(self) -> BrowserContext:
         config = self.config
@@ -98,7 +122,8 @@ class SessionManager:
                     extra_page.close()
                 navigate_with_retry(page, config.facebook.page_url,
                                     int(config.crawl.navigation_timeout_seconds * 1000), self.sleep_fn)
-                state = self._check_ready(page)
+                self._confirm_start(page)
+                state = self.adapter.check_session(page)
                 if state == SessionState.AUTHENTICATED:
                     logger.info('auth_verified', extra={'event': 'auth_verified'})
                     returned = True

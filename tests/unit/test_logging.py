@@ -32,3 +32,17 @@ def test_reconfigure_closes_old_handlers(tmp_path):
     assert len(logger.handlers) == 2
     assert all(handler not in logger.handlers for handler in old)
     close_logging()
+
+
+def test_round_timing_fields_are_written_without_post_content(tmp_path):
+    config_path = tmp_path / 'config.yaml'
+    config_path.write_text('{}')
+    config = load_config(config_path)
+    logger = configure_logging(config, 'timing-test', 'crawl')
+    timings = {'session_ms': 10.5, 'extraction_ms': 20.25, 'storage_ms': 2.5,
+               'scroll_ms': 100.0, 'duration_ms': 150.0}
+    logger.info('crawl_timing', extra={'event': 'crawl_timing', **timings, 'content': 'private body'})
+    close_logging()
+    record = json.loads((config.paths.log_dir / 'crawl.jsonl').read_text(encoding='utf-8'))
+    assert all(record.get(key) == value for key, value in timings.items())
+    assert 'content' not in record

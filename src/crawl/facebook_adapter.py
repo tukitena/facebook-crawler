@@ -7,6 +7,7 @@ import hashlib
 import re
 import time
 from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit, urlunsplit
 
 from playwright.sync_api import Error as PlaywrightError, Page, TimeoutError as PlaywrightTimeout
@@ -16,7 +17,7 @@ from src.errors import AppError
 from src.identity import make_post_id, normalize_display
 from src.models import ExtractedPost, ExtractionResult, FeedProgress, PostKind, SessionState
 
-ADAPTER_VERSION = 'facebook_dom_v3'
+ADAPTER_VERSION = 'facebook_dom_v5'
 MESSAGE = '[data-ad-preview="message"], [data-ad-rendering-role="story_message"], [data-testid="post_message"]'
 HEADER = '[data-ad-rendering-role="story_header"], h2, h3'
 POSITIONED_POST = '[aria-posinset]:has([data-virtualized])'
@@ -24,6 +25,7 @@ POST_BOUNDARY = f'[role="article"], {POSITIONED_POST}'
 ARTICLE = f'[role="feed"] [role="article"], [role="main"] {POSITIONED_POST}:has({HEADER}, {MESSAGE})'
 MORE = {'see more', 'xem thêm'}
 EXPANSION_STATE = 'facebook-crawler.pending-expansion'
+COMPLETED_STATE = 'facebook-crawler.completed-post'
 ACCOUNT = re.compile(r'^(Your profile|Your account|Account|Trang cá nhân của bạn|Tài khoản của bạn|Tài khoản)$', re.I)
 
 IN_VIEWPORT = '''e => {
@@ -33,8 +35,84 @@ IN_VIEWPORT = '''e => {
     const visibility = getComputedStyle(e).visibility;
     return visibility !== 'hidden' && visibility !== 'collapse';
 }'''
-VISIBLE_ARTICLES = '''(nodes, boundary) => nodes.filter(e =>
-    !e.parentElement.closest(boundary) && (''' + IN_VIEWPORT + ''')(e))'''
+# Discover candidates once, then let the browser track viewport intersections.
+# Only intersecting nodes need geometry/ownership checks on subsequent reads.
+VIEWPORT_ARTICLES = '''async args => {
+    const key = Symbol.for('facebook-crawler.viewport-index-v5');
+    let state = document[key];
+    if (!state) {
+        const selector = '[role="article"], [aria-posinset]';
+        const candidates = new Set(), visible = new Set();
+        const intersections = entries => {
+            for (const entry of entries) {
+                if (entry.isIntersecting && candidates.has(entry.target)) visible.add(entry.target);
+                else visible.delete(entry.target);
+            }
+        };
+        const viewport = new IntersectionObserver(intersections);
+        const add = node => {
+            if (!node.isConnected || candidates.has(node)) return;
+            candidates.add(node);
+            viewport.observe(node);
+        };
+        const remove = node => {
+            candidates.delete(node);
+            visible.delete(node);
+            viewport.unobserve(node);
+        };
+        const collect = (node, add) => {
+            if (node.nodeType !== Node.ELEMENT_NODE) return;
+            if (node.matches(selector)) add(node);
+            node.querySelectorAll(selector).forEach(add);
+        };
+        const update = records => {
+            for (const record of records) {
+                if (record.type === 'attributes') {
+                    if (record.target.matches(selector) && record.target.isConnected) add(record.target);
+                    else remove(record.target);
+                } else {
+                    record.removedNodes.forEach(node => collect(node, remove));
+                    record.addedNodes.forEach(node => collect(node, add));
+                }
+            }
+        };
+        const observer = new MutationObserver(update);
+        observer.observe(document, {subtree: true, childList: true, attributes: true,
+            attributeFilter: ['role', 'aria-posinset']});
+        document.querySelectorAll(selector).forEach(add);
+        state = document[key] = {candidates, visible, viewport, intersections, observer, update};
+    }
+    state.update(state.observer.takeRecords());
+    if (args.visible !== false) {
+        // A fresh observer's initial delivery follows an intersection update.
+        // takeRecords alone cannot refresh intersections after a scroll/resize.
+        await new Promise((resolve, reject) => {
+            const probe = new IntersectionObserver(() => {
+                clearTimeout(timer);
+                probe.disconnect();
+                state.intersections(state.viewport.takeRecords());
+                resolve();
+            });
+            const timer = setTimeout(() => {
+                probe.disconnect();
+                reject(new Error('Viewport observation timed out'));
+            }, 2000);
+            probe.observe(document.documentElement);
+        });
+    }
+    const visible = [];
+    for (const node of args.visible === false ? state.candidates : state.visible) {
+        if (!node.isConnected) continue;
+        if (args.visible !== false && !(''' + IN_VIEWPORT + ''')(node)) continue;
+        if (node.matches(args.selector) && !node.parentElement.closest(args.boundary)) {
+            if (args.first) return [node];
+            visible.push(node);
+        }
+    }
+    return visible.sort((a, b) => a === b ? 0 :
+        a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1);
+}'''
+ARTICLE_ARGS = {'selector': ARTICLE, 'boundary': POST_BOUNDARY, 'header': HEADER, 'body': MESSAGE}
 
 # One ownership rule for both extraction and the final atomic text read. A
 # message may carry a chain of nested markers; branching markers remain ambiguous.
@@ -45,6 +123,15 @@ OWNED_NODES = '''(article, args) => {
     const leaves = nodes.filter(e => !nodes.some(other => other !== e && e.contains(other)));
     if (leaves.length > 1) return leaves;
     return nodes.filter(e => !nodes.some(other => other !== e && other.contains(e)));
+}'''
+
+POST_FINGERPRINT = '''(article, args) => {
+    const owned = (''' + OWNED_NODES + ''');
+    const headers = owned(article, {...args, selector: args.header, message: false});
+    const messages = owned(article, {...args, selector: args.body, message: true});
+    return JSON.stringify([
+        headers.map(e => [e.innerText, Array.from(e.querySelectorAll('a[href]'),
+            a => a.getAttribute('href'))]), messages.map(e => e.innerText)]);
 }'''
 
 
@@ -105,48 +192,46 @@ class FacebookAdapter:
         if not current_identity or current_identity != self.identity:
             return SessionState.UNKNOWN
         headings = page.get_by_role('heading', name=self.config.facebook.page_name, exact=True)
-        has_heading = any(headings.nth(i).is_visible() and not headings.nth(i).evaluate(
-            '(e, boundary) => Boolean(e.closest(boundary))', POST_BOUNDARY)
-            for i in range(headings.count()))
+        has_heading = headings.filter(visible=True).evaluate_all(
+            '(nodes, boundary) => nodes.some(e => !e.closest(boundary))', POST_BOUNDARY)
         account = page.get_by_role('button', name=ACCOUNT)
-        has_account = any(account.nth(i).is_visible() for i in range(account.count()))
-        if has_heading and has_account and (page.locator('[role="feed"]').count() or page.locator(ARTICLE).count()):
+        has_account = bool(account.filter(visible=True).count())
+        if has_heading and has_account and (page.locator('[role="feed"]').count() or page.evaluate(
+                'async args => (await (' + VIEWPORT_ARTICLES + ')(args)).length',
+                {**ARTICLE_ARGS, 'visible': False, 'first': True})):
             return SessionState.AUTHENTICATED
         return SessionState.UNKNOWN
 
+    @contextmanager
     def _articles(self, page):
-        # Filter geometry in the browser before transferring any post handles or text.
-        nodes = page.evaluate_handle('''args => (''' + VISIBLE_ARTICLES + ''')(
-            Array.from(document.querySelectorAll(args.selector)), args.boundary)''',
-            {'selector': ARTICLE, 'boundary': POST_BOUNDARY})
-        try:
-            return [element for handle in nodes.get_properties().values()
-                    if (element := handle.as_element()) is not None]
-        finally:
-            nodes.dispose()
-
-    def _owned(self, article, selector):
-        nodes = article.evaluate_handle(OWNED_NODES, {
-            'selector': selector, 'boundary': POST_BOUNDARY, 'message': selector == MESSAGE,
-        })
-        try:
-            return [element for handle in nodes.get_properties().values()
-                    if (element := handle.as_element()) is not None]
-        finally:
-            nodes.dispose()
+        with ExitStack() as handles:
+            nodes = page.evaluate_handle(VIEWPORT_ARTICLES, ARTICLE_ARGS)
+            handles.callback(nodes.dispose)
+            articles = []
+            for handle in nodes.get_properties().values():
+                handles.callback(handle.dispose)
+                if (element := handle.as_element()) is not None:
+                    articles.append(element)
+            yield articles
 
     def _details(self, article):
-        headers = self._owned(article, HEADER)
-        if not headers:
+        data = article.evaluate('''(article, args) => {
+            const owned = (''' + OWNED_NODES + ''');
+            const header = owned(article, {...args, selector: args.header, message: false})[0];
+            const author = header && header.querySelector('a[href]');
+            if (!author) return null;
+            const messages = owned(article, {...args, selector: args.body, message: true});
+            const links = owned(article, {...args, selector: 'a[href]', message: false});
+            return {author: author.getAttribute('href'), name: author.innerText,
+                header: header.innerText, count: messages.length,
+                text: messages.length === 1 ? messages[0].innerText : '',
+                links: links.filter(e => !e.closest(args.body)).map(e => e.getAttribute('href'))};
+        }''', ARTICLE_ARGS)
+        if data is None:
             return None
-        header = headers[0]
-        authors = header.query_selector_all('a[href]')
-        if not authors:
-            return None
-        author = authors[0]
-        identity = page_identity(author.get_attribute('href') or '')
-        name = normalize_display(author.inner_text())
-        action = normalize_display(header.inner_text()).removeprefix(name).strip().casefold()
+        identity = page_identity(data['author'] or '')
+        name = normalize_display(data['name'])
+        action = normalize_display(data['header']).removeprefix(name).strip().casefold()
         kind = PostKind.UNKNOWN
         if re.search(r'updated (?:their|his|her|its) profile picture|đã cập nhật ảnh đại diện', action):
             kind = PostKind.PROFILE_UPDATE
@@ -156,22 +241,18 @@ class FacebookAdapter:
             kind = PostKind.SHARED
         elif not action:
             kind = PostKind.TEXT
-        messages = self._owned(article, MESSAGE)
-        links = self._owned(article, 'a[href]')
         # Links inside message text are data, not evidence of a source permalink.
-        permalinks = [post_permalink(link.get_attribute('href') or '') for link in links
-                      if not link.evaluate('(e, selector) => Boolean(e.closest(selector))', MESSAGE)]
+        permalinks = [post_permalink(href or '') for href in data['links']]
         permalink = next((value for value in permalinks if value), '')
-        message = messages[0] if len(messages) == 1 else None
         # This pre-expansion token only correlates extraction failures with retries.
-        signature_text = (message.inner_text() if message else '') + '\n' + action
+        signature_text = data['text'] + '\n' + action
         signature = permalink or 'dom_' + hashlib.sha256(signature_text.encode('utf-8')).hexdigest()
-        return identity, kind, message, signature, permalink, len(messages)
+        return identity, kind, signature, permalink, data['count']
 
     def visible_signatures(self, page: Page) -> frozenset[str]:
         """Cheap viewport snapshots for scroll progress, never post identities."""
-        snapshots = page.locator(ARTICLE).evaluate_all('''(nodes, args) => {
-            const visible = (''' + VISIBLE_ARTICLES + ''')(nodes, args.boundary);
+        snapshots = page.evaluate('''async args => {
+            const visible = await (''' + VIEWPORT_ARTICLES + ''')(args);
             const owned = (''' + OWNED_NODES + ''');
             return visible.map(article => {
                 const headers = owned(article, {...args, selector: args.header, message: false});
@@ -181,7 +262,7 @@ class FacebookAdapter:
                 return {author: author && author.getAttribute('href'),
                     text: JSON.stringify([header ? header.innerText : '', messages.map(e => e.innerText)])};
             });
-        }''', {'boundary': POST_BOUNDARY, 'header': HEADER, 'body': MESSAGE})
+        }''', ARTICLE_ARGS)
         return frozenset('viewport_' + hashlib.sha256(item['text'].encode('utf-8')).hexdigest()
                          for item in snapshots if page_identity(item['author'] or '') == self.identity)
 
@@ -229,74 +310,108 @@ class FacebookAdapter:
             page.wait_for_timeout(min(25, max(1, (deadline - time.monotonic()) * 1000)))
         raise PlaywrightTimeout('Expansion did not produce settled full text')
 
-    def extract_visible_posts(self, page: Page) -> Iterator[ExtractionResult]:
-        articles = self._articles(page)
-        if not articles:
-            if not page.locator(ARTICLE).count():
-                yield ExtractionResult('layout:no_articles', error_code='UNSUPPORTED_LAYOUT')
-            return
-        for article in articles:
-            signature = 'layout:unrecognized'
-            try:
-                # Expanding an earlier post can move the next one below the viewport.
-                if not article.evaluate(IN_VIEWPORT):
-                    continue
-                details = self._details(article)
-                if details is None:
-                    yield ExtractionResult(signature, error_code='UNKNOWN_AUTHOR')
-                    continue
-                identity, kind, body, signature, permalink, message_count = details
-                if not identity:
-                    yield ExtractionResult(signature, error_code='UNKNOWN_AUTHOR')
-                    continue
-                if identity != self.identity:
-                    continue
-                if message_count > 1:
-                    yield ExtractionResult(signature, error_code='AMBIGUOUS_MESSAGE')
-                    continue
-                if body is None:
-                    # An avatar or attachment does not prove a caption is absent.
-                    yield ExtractionResult(signature, error_code='UNSUPPORTED_LAYOUT')
-                    continue
-                controls = [node for node in body.query_selector_all('button, [role="button"]')
-                            if node.inner_text().strip().casefold() in MORE]
-                snapshot = self._message_snapshot(body)
-                if snapshot['pending']:
-                    signature = snapshot['pending']['observation_id']
-                expanded_text = None
-                if controls or snapshot['pending']:
-                    position = page.evaluate('({x: window.scrollX, y: window.scrollY})')
+    def extract_visible_posts(self, page: Page, *, handled_ids: set[str] | None = None) -> Iterator[ExtractionResult]:
+        with self._articles(page) as articles:
+            if not articles:
+                if not page.evaluate('async args => (await (' + VIEWPORT_ARTICLES + ')(args)).length',
+                                     {**ARTICLE_ARGS, 'visible': False, 'first': True}):
+                    yield ExtractionResult('layout:no_articles', error_code='UNSUPPORTED_LAYOUT')
+                return
+            for article in articles:
+                signature = 'layout:unrecognized'
+                with ExitStack() as handles:
                     try:
-                        expanded_text = self._expand(page, body, controls[0] if controls else None, signature)
-                    finally:
-                        # Playwright may scroll to the control; keep unread posts ahead of the cursor.
-                        if not page.is_closed():
-                            page.evaluate('p => window.scrollTo({left: p.x, top: p.y, behavior: "instant"})', position)
-                if not body.evaluate('(e) => e.isConnected'):
-                    raise PlaywrightTimeout('Message detached')
-                after = self._details(article)
-                if not after or after[0] != identity or after[4] != permalink or after[5] != 1:
-                    raise PlaywrightTimeout('Article changed during extraction')
-                # Revalidate ownership and read text in the same browser task.
-                text = normalize_display(body.evaluate('''(body, args) => {
-                    const owned = (''' + OWNED_NODES + ''')(args.article, args);
-                    if (!body.isConnected || owned.length !== 1 || owned[0] !== body)
-                        throw new Error('Message changed during extraction');
-                    return body.innerText;
-                }''', {'article': article, 'selector': MESSAGE, 'boundary': POST_BOUNDARY, 'message': True}))
-                if expanded_text is not None and text != expanded_text:
-                    raise PlaywrightTimeout('Expanded message changed before extraction')
-                if expanded_text is not None:
-                    body.evaluate('(body, key) => delete body[Symbol.for(key)]', EXPANSION_STATE)
-                if text:
-                    yield ExtractionResult(make_post_id(text), ExtractedPost(text, permalink, kind),
-                                           observation_id=signature)
-                else:
-                    yield ExtractionResult(signature)
-            except PlaywrightError:
-                if page.is_closed():
-                    raise
-                yield ExtractionResult(signature, error_code='INCOMPLETE_CONTENT')
+                        # Expanding an earlier post can move the next one below the viewport.
+                        if not article.evaluate(IN_VIEWPORT):
+                            continue
+                        if handled_ids:
+                            cached_id = article.evaluate('''(article, args) => {
+                                const cached = article[Symbol.for(args.key)];
+                                if (!cached) return null;
+                                if (cached.fingerprint === (''' + POST_FINGERPRINT + ''')(article, args))
+                                    return cached.id;
+                                // A changed node must finish a fresh extraction, even if
+                                // a failed refresh subsequently restores its old text.
+                                delete article[Symbol.for(args.key)];
+                                return null;
+                            }''', {**ARTICLE_ARGS, 'key': COMPLETED_STATE})
+                            if cached_id in handled_ids:
+                                continue
+                        details = self._details(article)
+                        if details is None:
+                            yield ExtractionResult(signature, error_code='UNKNOWN_AUTHOR')
+                            continue
+                        identity, kind, signature, permalink, message_count = details
+                        if not identity:
+                            yield ExtractionResult(signature, error_code='UNKNOWN_AUTHOR')
+                            continue
+                        if identity != self.identity:
+                            continue
+                        if message_count > 1:
+                            yield ExtractionResult(signature, error_code='AMBIGUOUS_MESSAGE')
+                            continue
+                        if not message_count:
+                            # An avatar or attachment does not prove a caption is absent.
+                            yield ExtractionResult(signature, error_code='UNSUPPORTED_LAYOUT')
+                            continue
+                        body_handle = article.evaluate_handle('''(article, args) => {
+                            const messages = (''' + OWNED_NODES + ''')(article, args);
+                            return messages.length === 1 ? messages[0] : null;
+                        }''', {'selector': MESSAGE, 'boundary': POST_BOUNDARY, 'message': True})
+                        handles.callback(body_handle.dispose)
+                        body = body_handle.as_element()
+                        if body is None:
+                            raise PlaywrightTimeout('Message changed during extraction')
+                        control_nodes = body.query_selector_all('button, [role="button"]')
+                        for node in control_nodes:
+                            handles.callback(node.dispose)
+                        controls = [node for node in control_nodes
+                                    if node.inner_text().strip().casefold() in MORE]
+                        snapshot = self._message_snapshot(body)
+                        if snapshot['pending']:
+                            signature = snapshot['pending']['observation_id']
+                        expanded_text = None
+                        if controls or snapshot['pending']:
+                            position = page.evaluate('({x: window.scrollX, y: window.scrollY})')
+                            try:
+                                expanded_text = self._expand(page, body, controls[0] if controls else None, signature)
+                            finally:
+                                # Playwright may scroll to the control; keep unread posts ahead of the cursor.
+                                if not page.is_closed():
+                                    page.evaluate('p => window.scrollTo({left: p.x, top: p.y, behavior: "instant"})', position)
+                        if not body.evaluate('(e) => e.isConnected'):
+                            raise PlaywrightTimeout('Message detached')
+                        after = self._details(article)
+                        if not after or after[0] != identity or after[3] != permalink or after[4] != 1:
+                            raise PlaywrightTimeout('Article changed during extraction')
+                        # Revalidate ownership, text and the cache token in one browser task.
+                        final = body.evaluate('''(body, args) => {
+                            const owned = (''' + OWNED_NODES + ''')(args.article, args);
+                            if (!body.isConnected || owned.length !== 1 || owned[0] !== body)
+                                throw new Error('Message changed during extraction');
+                            return {text: body.innerText,
+                                fingerprint: (''' + POST_FINGERPRINT + ''')(args.article, args)};
+                        }''', {**ARTICLE_ARGS, 'article': article, 'selector': MESSAGE, 'message': True})
+                        text = normalize_display(final['text'])
+                        if expanded_text is not None and text != expanded_text:
+                            raise PlaywrightTimeout('Expanded message changed before extraction')
+                        if expanded_text is not None:
+                            body.evaluate('(body, key) => delete body[Symbol.for(key)]', EXPANSION_STATE)
+                        if text:
+                            post_id = make_post_id(text)
+                            article.evaluate('''(article, args) => {
+                                if ((''' + POST_FINGERPRINT + ''')(article, args) === args.fingerprint)
+                                    article[Symbol.for(args.key)] = {id: args.id, fingerprint: args.fingerprint};
+                            }''', {**ARTICLE_ARGS, 'key': COMPLETED_STATE, 'id': post_id,
+                                   'fingerprint': final['fingerprint']})
+                            yield ExtractionResult(post_id, ExtractedPost(text, permalink, kind),
+                                                   observation_id=signature)
+                        else:
+                            yield ExtractionResult(signature)
+                    except PlaywrightError:
+                        if page.is_closed():
+                            raise
+                        yield ExtractionResult(signature, error_code='INCOMPLETE_CONTENT')
 
     def scroll_and_wait(self, page: Page) -> FeedProgress:
         before = self.visible_signatures(page)
