@@ -6,6 +6,9 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Sequence
 
+from src.classify.models import ClassificationStats
+from src.classify.service import classify
+from src.classify.storage import validate_classify_paths
 from src.config import load_config
 from src.crawl.service import crawl
 from src.errors import AppError
@@ -45,6 +48,33 @@ class PreprocessConsoleProgress:
             self.last = now
 
 
+class ClassificationConsoleProgress:
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.started = clock()
+        self.last = float('-inf')
+        self.failed = 0
+
+    def __call__(self, stats: ClassificationStats, *, force: bool = False) -> None:
+        now = self.clock()
+        if force or stats.failed > self.failed or now - self.last >= 1:
+            fields = ' '.join(f'{key}={value}' for key, value in asdict(stats).items())
+            review_rate = stats.reviewed_new / stats.newly_saved if stats.newly_saved else 0
+            print(f'{fields} review_rate={review_rate:.1%} elapsed={now - self.started:.1f}s', file=sys.stderr)
+            self.last = now
+        self.failed = stats.failed
+
+
+def positive_limit(value: str) -> int:
+    try:
+        limit = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError('limit must be a positive integer') from None
+    if limit <= 0:
+        raise argparse.ArgumentTypeError('limit must be a positive integer')
+    return limit
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     # Windows redirected streams may otherwise use cp1252 and reject Vietnamese.
     for stream in (sys.stdout, sys.stderr):
@@ -62,6 +92,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                                     'Giữ profile đăng nhập, config, log, report và file thủ công; không tự chạy crawl.')
     commands.add_parser('preprocess', help='Tách, làm sạch và dedup confession từ raw; chạy offline.',
                         description='Rebuild confessions, sources và excluded từ raw; giữ nguyên raw và kiểm tra nhãn cũ.')
+    classifier = commands.add_parser('classify', help='Gắn nhãn tác động tới UIT bằng Ollama; tiếp tục các ID chưa lưu.',
+                                     description='Gắn nhãn confession đã preprocess; giữ nhãn đã lưu và tiếp tục khi chạy lại.')
+    classifier.add_argument('--limit', type=positive_limit,
+                            help='Số ID chưa hoàn tất được xử lý tối đa; phải là số nguyên dương.')
     args = parser.parse_args(argv)
     run_id = str(uuid.uuid4())
     try:
@@ -72,6 +106,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             validate_reset_paths(config, args.config)
         elif args.command == 'preprocess':
             validate_preprocess_paths(config, args.config)
+        elif args.command == 'classify':
+            validate_classify_paths(config, args.config)
         configure_logging(config, run_id, args.command)
         if args.command == 'reset':
             reset_dataset(config, config_path=args.config)
@@ -85,6 +121,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f'preprocess: {result.status}; generation={result.generation_id}; '
                   f'report={config.paths.reports_dir / (run_id + ".json")}', file=sys.stderr)
             return result.exit_code
+        if args.command == 'classify':
+            progress = ClassificationConsoleProgress()
+            result = classify(config, limit=args.limit, progress=progress, run_id=run_id, config_path=args.config)
+            progress(result.stats, force=True)
+            print(f'classify: {result.status}; stop_reason={result.stop_reason}; '
+                  f'report={config.paths.reports_dir / (run_id + ".json")}', file=sys.stderr)
+            return result.exit_code
         progress = ConsoleProgress()
         result = crawl(config, progress=progress, run_id=run_id)
         progress(result.stats, force=True)
@@ -95,6 +138,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print('candidate_segments là số marker tạm đếm, chưa phải số confession đã tiền xử lý.', file=sys.stderr)
         return result.exit_code
     except KeyboardInterrupt:
+        if args.command == 'classify':
+            print('Đã ngắt classify; nhãn đã lưu được giữ lại. Chạy lại classify để tiếp tục. (exit 130)',
+                  file=sys.stderr)
+            return 130
         if args.command == 'preprocess':
             print('Đã ngắt preprocess; raw giữ nguyên. Xem report để biết generation đã publish hay chưa; '
                   'chạy lại preprocess để rebuild. (exit 130)', file=sys.stderr)
@@ -112,6 +159,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Browser exception strings can contain DOM snippets or session details.
         if args.command == 'preprocess':
             print(f'RUNTIME_ERROR ({type(exc).__name__}): preprocess đã dừng; kiểm tra cấu hình và report.', file=sys.stderr)
+        elif args.command == 'classify':
+            print(f'RUNTIME_ERROR ({type(exc).__name__}): classify đã dừng; kiểm tra cấu hình và report.', file=sys.stderr)
         else:
             print(f'RUNTIME_ERROR ({type(exc).__name__}): lệnh đã dừng; kiểm tra cấu hình, Chrome và file report.', file=sys.stderr)
         return 1

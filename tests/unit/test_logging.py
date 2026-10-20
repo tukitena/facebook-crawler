@@ -64,3 +64,32 @@ def test_round_timing_fields_are_written_without_post_content(tmp_path):
     record = json.loads((config.paths.log_dir / 'crawl.jsonl').read_text(encoding='utf-8'))
     assert all(record.get(key) == value for key, value in timings.items())
     assert 'content' not in record
+
+
+def test_classification_events_keep_counters_and_exclude_private_payloads(tmp_path, capsys):
+    from src.classify.models import ClassificationStats
+
+    config_path = tmp_path / 'config.yaml'
+    config_path.write_text('{}')
+    config = load_config(config_path)
+    logger = configure_logging(config, 'classification-test', 'classify')
+    counters = asdict(ClassificationStats(total=10, already_done=3, attempted=4,
+                    newly_saved=2, failed=2, remaining=5, reviewed_new=1, reviewed_total=2))
+    for event in ('classification_retry', 'label_saved', 'classification_failed', 'run_finished'):
+        logger.warning('private confession', extra={
+            'event': event, 'attempt': 2, 'duration_ms': 123, 'error_code': 'MODEL_TIMEOUT',
+            'classification_fingerprint': 'a' * 64, **counters,
+            'content': 'private confession', 'prompt': 'private system prompt',
+            'response_body': 'private HTTP error body', 'reason': 'private model reason',
+        })
+    close_logging()
+    output = (config.paths.log_dir / 'crawl.jsonl').read_text(encoding='utf-8')
+    records = [json.loads(line) for line in output.splitlines()]
+    assert len(records) == 4
+    for record in records:
+        assert record['command'] == 'classify'
+        assert all(record.get(name) == value for name, value in counters.items())
+        assert record['attempt'] == 2 and record['duration_ms'] == 123
+        assert record['error_code'] == 'MODEL_TIMEOUT'
+        assert record['classification_fingerprint'] == 'a' * 64
+    assert 'private' not in output + capsys.readouterr().err

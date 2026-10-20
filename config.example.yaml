@@ -1,5 +1,9 @@
 schema_version: 1
 
+school:
+  name: "Trường Đại học Công nghệ Thông tin"
+  aliases: ["UIT", "Đại học Công nghệ Thông tin", "ĐH CNTT"]
+
 facebook:
   page_name: "UIT Confessions"
   page_url: "https://www.facebook.com/UITconfess"
@@ -37,6 +41,29 @@ preprocess:
   short_content_chars: 10
   excluded_post_patterns: []
   overrides_csv: null
+
+ollama:
+  base_url: http://127.0.0.1:11434
+  model: qwen3:8b
+  temperature: 0
+  seed: 42
+  num_ctx: 8192
+  num_predict: 512
+  think: false
+  keep_alive: 5m
+  connect_timeout_seconds: 5
+  read_timeout_seconds: 120
+  write_timeout_seconds: 10
+  pool_timeout_seconds: 5
+
+classification:
+  # Relative to this YAML file; adjust when placing the config elsewhere.
+  prompt_path: src/classify/prompts/uit-impact-v1.txt
+  max_attempts: 3
+  review_threshold: 0.70
+  max_content_utf8_bytes: 6000
+  context_margin: 1024
+  consecutive_service_failures: 3
 
 logging:
   level: "INFO"

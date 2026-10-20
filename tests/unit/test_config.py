@@ -119,3 +119,30 @@ def test_classification_attempts_reject_out_of_budget_values(tmp_path, attempts)
 def test_classification_attempts_allow_one_to_three(tmp_path, attempts):
     config = load_config(write_config(tmp_path, f'classification: {{max_attempts: {attempts}}}'))
     assert config.classification.max_attempts == attempts
+
+
+def test_legacy_config_uses_classification_defaults(tmp_path):
+    config = load_config(write_config(tmp_path, 'crawl: {max_posts: 5}'))
+    assert config.school.name == 'Trường Đại học Công nghệ Thông tin'
+    assert config.ollama.model == 'qwen3:8b'
+    assert config.ollama.think is False
+    assert config.classification.max_attempts == 3
+    assert config.classification.review_threshold == .70
+    assert config.classification.prompt_path == tmp_path / 'src/classify/prompts/uit-impact-v1.txt'
+
+
+def test_example_loads_classification_defaults_and_resolves_prompt():
+    from pathlib import Path
+    import yaml
+
+    path = Path(__file__).resolve().parents[2] / 'config.example.yaml'
+    values = yaml.safe_load(path.read_text(encoding='utf-8'))
+    assert {'school', 'ollama', 'classification'} <= values.keys()
+    config = load_config(path)
+    assert config.classification.prompt_path.is_file()
+    assert config.ollama.num_ctx == 8192 and config.ollama.num_predict == 512
+    assert config.ollama.temperature == 0 and config.ollama.seed == 42
+    assert config.ollama.keep_alive == '5m'
+    assert config.classification.max_content_utf8_bytes == 6000
+    assert config.classification.context_margin == 1024
+    assert config.classification.consecutive_service_failures == 3

@@ -12,7 +12,9 @@ SAFE_FIELDS = ('record_id', 'attempt', 'duration_ms', 'error_code', 'seen_posts'
                'session_ms', 'extraction_ms', 'storage_ms', 'scroll_ms',
                'read_posts', 'accepted_posts', 'excluded_posts', 'empty_segments',
                'unique_confessions', 'duplicate_confessions', 'sources', 'excluded_regions',
-               'separators', 'ui_controls_removed', 'footers_removed')
+               'separators', 'ui_controls_removed', 'footers_removed',
+               'total', 'already_done', 'attempted', 'newly_saved', 'failed', 'remaining',
+               'reviewed_new', 'reviewed_total', 'classification_fingerprint')
 
 
 class JsonFormatter(logging.Formatter):
