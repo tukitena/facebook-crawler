@@ -20,3 +20,7 @@ def canonical_text(text: str) -> str:
 
 def make_post_id(content: str) -> str:
     return 'post_' + hashlib.sha256(('post:v1\n' + canonical_text(content)).encode('utf-8')).hexdigest()
+
+
+def make_confession_id(body: str) -> str:
+    return 'cfs_' + hashlib.sha256(('confession:v1\n' + canonical_text(body)).encode('utf-8')).hexdigest()

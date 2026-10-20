@@ -1,1 +1,1 @@
-"""Post filtering, confession splitting, and deduplication."""
+"""Deterministic preprocessing of raw confession posts."""

@@ -15,3 +15,15 @@ def test_hash_exact_and_whitespace_dedup():
     assert make_post_id(' #1 Xin\tchào ') == expected
     assert make_post_id('#2 Xin chào') != expected
     assert make_post_id('#1 xin chào') != expected
+
+
+def test_confession_identity_uses_body_namespace_and_canonical_whitespace():
+    from src import identity
+    expected = 'cfs_' + hashlib.sha256('confession:v1\nXin chào'.encode('utf-8')).hexdigest()
+    assert identity.make_confession_id(' Xin\tchào ') == expected
+    assert identity.make_confession_id('Xin\nchào') == expected
+    assert identity.make_confession_id('Xin cha\u0300o') == expected
+    assert identity.make_confession_id('Xin\xa0chào') == expected
+    assert identity.make_confession_id('xin chào') != expected
+    assert identity.make_confession_id('Xin chào 😊') != expected
+    assert identity.make_confession_id('Xin chào') != make_post_id('Xin chào')
