@@ -1,13 +1,14 @@
 """Text-processing contracts and validated CSV records."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+from datetime import datetime, timezone
 import re
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from src.identity import make_confession_id, normalize_display
+from src.identity import NORMALIZATION_VERSION, make_confession_id, normalize_display
 
 CONFESSION_FIELDS = ('id', 'content', 'confession_number')
 SOURCE_FIELDS = ('confession_id', 'post_id', 'marker', 'start_line', 'end_line', 'source_url', 'flags')
@@ -174,3 +175,55 @@ class PreprocessSummary:
     exit_code: int
     generation_id: str | None = None
     published: bool = False
+
+
+MANIFEST_SCHEMA_VERSION = 1
+FILTER_VERSION = 'preprocess_filter_v1'
+SPLITTER_VERSION = 'line_start_numeric_v2'
+SHA256 = Annotated[str, Field(strict=True, pattern=r'^[0-9a-f]{64}$')]
+Count = Annotated[int, Field(strict=True, ge=0)]
+
+
+class OutputInfo(Record):
+    sha256: SHA256
+    rows: Count
+
+
+class PreprocessManifest(Record):
+    schema_version: Literal[1]
+    generation_id: Annotated[str, Field(min_length=1)]
+    created_at: str
+    page_url: str
+    raw_csv_sha256: SHA256
+    raw_metadata_sha256: SHA256
+    effective_config: dict[str, object]
+    effective_config_sha256: SHA256
+    overrides_sha256: SHA256 | None
+    normalization_version: str
+    filter_version: str
+    splitter_version: str
+    confession_fields: tuple[str, ...]
+    outputs: dict[str, OutputInfo]
+    counts: dict[str, Count]
+    excluded_by_reason: dict[str, Count]
+
+    @field_validator('schema_version', mode='before')
+    @classmethod
+    def strict_version(cls, value):
+        if type(value) is not int:
+            raise ValueError('Schema version must be an integer')
+        return value
+
+    @model_validator(mode='after')
+    def validate_manifest(self):
+        if self.confession_fields != CONFESSION_FIELDS:
+            raise ValueError('Wrong confession schema')
+        if set(self.outputs) != {'confessions.csv', 'sources.csv', 'excluded.csv'}:
+            raise ValueError('Wrong generation file set')
+        if set(self.counts) != {item.name for item in fields(PreprocessStats)}:
+            raise ValueError('Wrong counter set')
+        if set(self.excluded_by_reason) - EXCLUSION_REASONS:
+            raise ValueError('Unrecognized exclusion reason')
+        if not self.created_at.endswith('Z') or datetime.fromisoformat(self.created_at).utcoffset() != timezone.utc.utcoffset(None):
+            raise ValueError('Timestamp must be UTC with Z')
+        return self
