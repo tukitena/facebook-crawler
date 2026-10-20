@@ -146,6 +146,9 @@ class LabelStore:
         self.snapshot = snapshot
         self.completed: set[str] = set()
         self.reviewed_total = 0
+        # Consumers may trust completed only after all resume files validated,
+        # even when a subsequent initialization write/reconciliation fails.
+        self.existing_validated = False
         self._content = {row.id: row.content for row in snapshot.confessions}
         self._failures: dict[str, FailureRecord] = {}
         self._stream = None
@@ -201,7 +204,9 @@ class LabelStore:
         try:
             if self._stream is not None or self._poisoned:
                 raise AppError('STORAGE_ERROR', 'Classification writer cannot be reopened.')
+            self.existing_validated = False
             has_metadata = self._read_existing()
+            self.existing_validated = True
             self.directory.mkdir(parents=True, exist_ok=True)
             if not has_metadata:
                 atomic_write_json(self.directory / _METADATA, self.metadata.model_dump(mode='json'))

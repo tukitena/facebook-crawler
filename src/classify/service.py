@@ -1,6 +1,7 @@
 """Sequential, resumable labeling under the dataset's exclusive lock."""
 
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import asdict, replace
 import logging
 from pathlib import Path
@@ -94,11 +95,16 @@ def classify(config: AppConfig, limit: int | None = None, *,
             with client_factory(config, bundle) as client:
                 identity = client.preflight()
                 metadata = build_metadata(config, snapshot, identity, bundle)
-                with LabelStore(config.paths.labeled_dir, metadata, snapshot) as store:
-                    stats.already_done = len(store.completed)
-                    stats.reviewed_total = reviewed_before = store.reviewed_total
-                    stats.remaining = stats.total - stats.already_done
-                    store_ready = True
+                store = LabelStore(config.paths.labeled_dir, metadata, snapshot)
+                with ExitStack() as stack:
+                    # Entry can atomically reconcile stale failures. Register
+                    # cleanup and initialize counters before delivering SIGINT.
+                    with defer_sigint():
+                        stack.enter_context(store)
+                        stats.already_done = len(store.completed)
+                        stats.reviewed_total = reviewed_before = store.reviewed_total
+                        stats.remaining = stats.total - stats.already_done
+                        store_ready = True
                     store.reconcile_failures()
                     service_streak = 0
                     for confession in snapshot.confessions:
@@ -157,6 +163,12 @@ def classify(config: AppConfig, limit: int | None = None, *,
             primary_error = error
             summary.status, summary.stop_reason, summary.exit_code = 'failed', error.code, error.exit_code
         finally:
+            if store is not None and store.existing_validated and not store_ready:
+                # An initialization write may fail after strict resume validation.
+                # Partially read/invalid CSV state must never enter these counters.
+                stats.already_done = len(store.completed)
+                reviewed_before = store.reviewed_total
+                store_ready = True
             if store_ready:
                 # Durable store state is authoritative even if an interrupt arrives
                 # immediately after append or while reconciling stale failures.

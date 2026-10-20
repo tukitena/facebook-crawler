@@ -405,3 +405,75 @@ def test_report_and_client_shutdown_remain_under_dataset_lock(config, monkeypatc
     assert result.stats.newly_saved == 1
     with resource_lock(config.paths.data_dir / '.dataset.lock'):
         pass
+
+
+@pytest.mark.parametrize('failure', ['signal', 'storage'])
+def test_resume_entry_reconciliation_preserves_existing_counters(config, monkeypatch, failure):
+    module = service()
+    module.classify(config, 1, client_factory=FakeClient([invalid()] * 3), sleep=lambda _: None)
+    original = module.LabelStore.reconcile_failures
+
+    def interrupt_before_cleanup(store):
+        if store.completed:
+            raise KeyboardInterrupt
+        original(store)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module.LabelStore, 'reconcile_failures', interrupt_before_cleanup)
+        saved = module.classify(config, 1, client_factory=FakeClient([prediction(confidence=0.5)]))
+    assert saved.stats.newly_saved == 1
+    assert len(rows(config)) == len(rows(config, 'classification_failures.csv')) == 1
+    label_bytes = (config.paths.labeled_dir / 'labeled.csv').read_bytes()
+    storage = import_module('src.classify.storage')
+    replace = storage.os.replace
+    exit_store = module.LabelStore.__exit__
+    closed = []
+
+    def interrupted_replace(source, destination):
+        if Path(destination).name == 'classification_failures.csv':
+            if failure == 'storage':
+                raise PermissionError('failure file is held open')
+            replace(source, destination)
+            signal.raise_signal(signal.SIGINT)
+        else:
+            replace(source, destination)
+
+    def close(store, *args):
+        exit_store(store, *args)
+        closed.append(True)
+
+    monkeypatch.setattr(storage.os, 'replace', interrupted_replace)
+    monkeypatch.setattr(module.LabelStore, '__exit__', close)
+    run_id = '00000000-0000-0000-0000-000000000008'
+    client = FakeClient()
+    if failure == 'signal':
+        result = module.classify(config, client_factory=client, run_id=run_id)
+        assert result.exit_code == 130 and result.status == 'interrupted'
+        assert (result.stats.already_done, result.stats.remaining) == (1, 2)
+        assert closed == [True]
+    else:
+        with pytest.raises(AppError) as error:
+            module.classify(config, client_factory=client, run_id=run_id)
+        assert error.value.code == 'OUTPUT_LOCKED'
+    data = json.loads((config.paths.reports_dir / f'{run_id}.json').read_text())
+    assert data['stats'] == dict(total=3, already_done=1, attempted=0, newly_saved=0,
+        failed=0, remaining=2, reviewed_new=0, reviewed_total=1)
+    assert (config.paths.labeled_dir / 'labeled.csv').read_bytes() == label_bytes
+    assert client.calls == [] and client.closed
+
+
+def test_invalid_resume_never_trusts_partially_loaded_completed_ids(config):
+    module = service()
+    module.classify(config, 1, client_factory=FakeClient([prediction()]))
+    path = config.paths.labeled_dir / 'labeled.csv'
+    data = path.read_bytes()
+    # The first record validates and enters completed; the duplicate fails later.
+    path.write_bytes(data + data[3:].split(b'\r\n', 1)[1])
+    before = path.read_bytes()
+    run_id = '00000000-0000-0000-0000-000000000009'
+    with pytest.raises(AppError) as error:
+        module.classify(config, client_factory=FakeClient(), run_id=run_id)
+    assert error.value.code == 'INVALID_CSV'
+    report_data = json.loads((config.paths.reports_dir / f'{run_id}.json').read_text())
+    assert report_data['stats']['already_done'] == 0
+    assert report_data['stats']['newly_saved'] == 0 and path.read_bytes() == before
