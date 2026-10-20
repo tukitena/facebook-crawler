@@ -65,6 +65,8 @@ class ExtractionResult:
     signature: str
     post: ExtractedPost | None = None
     error_code: str | None = None
+    # A retry correlation token, never a post identity or a seen-post counter.
+    observation_id: str = ''
 
     def __post_init__(self):
         if self.post is not None and self.error_code is not None:
@@ -74,6 +76,7 @@ class ExtractionResult:
 @dataclass(frozen=True)
 class FeedProgress:
     signatures: frozenset[str]
+    advanced: bool = False
 
 
 @dataclass

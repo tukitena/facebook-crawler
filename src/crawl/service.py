@@ -29,6 +29,7 @@ def crawl_feed(page: Page, adapter: FacebookAdapter, store: RawPostStore, config
     media_seen: set[str] = set()
     unresolved: set[str] = set()
     pending_signatures: frozenset[str] = frozenset()
+    viewport_advanced = False
     while True:
         state = adapter.check_session(page)
         if state != SessionState.AUTHENTICATED:
@@ -37,15 +38,15 @@ def crawl_feed(page: Page, adapter: FacebookAdapter, store: RawPostStore, config
         for result in adapter.extract_visible_posts(page):
             if result.signature not in observed:
                 new_signatures.add(result.signature)
-                stats.seen_posts += 1
                 observed.add(result.signature)
+            observation_id = result.observation_id or result.signature
             if result.error_code:
-                unresolved.add(result.signature)
+                unresolved.add(observation_id)
                 stats.extraction_errors += 1
                 logger.warning('extraction_failed', extra={'event': 'extraction_failed', 'error_code': result.error_code,
                                                           'extraction_errors': stats.extraction_errors})
                 continue
-            unresolved.discard(result.signature)
+            unresolved.discard(observation_id)
             if result.post is None:
                 if result.signature not in media_seen:
                     media_seen.add(result.signature)
@@ -56,6 +57,8 @@ def crawl_feed(page: Page, adapter: FacebookAdapter, store: RawPostStore, config
             post_id = make_post_id(content)
             if post_id in handled_ids:
                 continue
+            stats.seen_posts += 1
+            new_signatures.add(post_id)
             post = RawPost(id=post_id, content=content, crawled_at=utc_now(),
                            source_url=result.post.source_url, post_kind=result.post.post_kind)
             # Defer SIGINT through both durable append and the matching counters.
@@ -75,14 +78,16 @@ def crawl_feed(page: Page, adapter: FacebookAdapter, store: RawPostStore, config
                 return 'max_posts', 3 if unresolved else 0
         observed.update(pending_signatures)
         if stats.scrolls:
-            stats.no_progress_rounds = 0 if new_signatures else stats.no_progress_rounds + 1
+            stats.no_progress_rounds = 0 if new_signatures or viewport_advanced else stats.no_progress_rounds + 1
         if progress:
             progress(stats)
         if stats.no_progress_rounds >= config.crawl.no_progress_rounds:
             return 'no_progress', 3 if unresolved else 0
         if stats.scrolls >= config.crawl.max_scrolls:
             return 'max_scrolls', 3 if unresolved else 0
-        pending_signatures = adapter.scroll_and_wait(page).signatures
+        feed_progress = adapter.scroll_and_wait(page)
+        pending_signatures = feed_progress.signatures
+        viewport_advanced = feed_progress.advanced
         stats.scrolls += 1
 
 

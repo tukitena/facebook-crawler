@@ -15,6 +15,8 @@ def adapter():
 
 
 def test_only_top_level_messages_and_scoped_expansion(page, feed_html):
+    # This ownership test intentionally puts the complete fixture in the viewport.
+    page.set_viewport_size({'width': 1280, 'height': 1600})
     page.set_content(feed_html)
     results = list(adapter().extract_visible_posts(page))
     posts = [result.post for result in results if result.post]
@@ -68,13 +70,14 @@ def test_reactions_do_not_change_signatures(page, feed_html):
 
 
 def test_virtualized_same_height_feed_progresses(page, feed_html):
+    page.set_viewport_size({'width': 1280, 'height': 1600})
     page.set_content(feed_html)
     instance = adapter()
     instance.config.crawl.scroll_delay_seconds = 0.01
     instance.config.crawl.feed_wait_timeout_seconds = 0.1
     before = instance.visible_signatures(page)
-    page.evaluate('''() => { const scroll = window.scrollBy; window.scrollBy = (...args) => {
-        document.querySelector('#first a[href*="posts"]').href='/UITconfess/posts/999'; scroll(...args);
+    page.evaluate('''() => { window.scrollBy = () => {
+        document.querySelector('#first [data-ad-preview]').textContent = '#999 New virtualized content';
     }; }''')
     assert instance.scroll_and_wait(page).signatures != before
 
@@ -89,7 +92,7 @@ def test_see_more_disappearing_before_text_arrives_does_not_save_prefix(page, fe
     instance = adapter()
     instance.config.crawl.action_timeout_seconds = 1
     results = list(instance.extract_visible_posts(page))
-    target = next(r for r in results if r.signature.endswith('/posts/102'))
+    target = next(r for r in results if r.post and r.post.source_url.endswith('/posts/102'))
     assert target.error_code is None
     assert target.post.content == '#3 Nội dung đầy đủ\nGiữ dòng hai.'
 

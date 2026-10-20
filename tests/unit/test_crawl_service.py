@@ -49,6 +49,7 @@ def test_resume_crosses_duplicate_only_screens(tmp_path):
     assert (reason, code) == ('max_posts', 0)
     assert stats.saved_posts == 1
     assert stats.duplicate_posts == 2
+    assert stats.seen_posts == 3
     assert stats.scrolls == 2
     assert stats.candidate_segments == 1
 
@@ -109,6 +110,8 @@ def test_edited_post_same_permalink_is_saved(tmp_path):
     config = AppConfig()
     config.crawl.max_posts = 2
     adapter = FakeAdapter([[result('#1 First', 'same_url')], [result('#1 Edited', 'same_url')]])
+    stats = CrawlStats()
     with RawPostStore(tmp_path / 'raw.csv', URL) as store:
-        assert crawl_feed(None, adapter, store, config, CrawlStats(), None) == ('max_posts', 0)
+        assert crawl_feed(None, adapter, store, config, stats, None) == ('max_posts', 0)
         assert len(store.existing) == 2
+    assert stats.seen_posts == stats.saved_posts == 2

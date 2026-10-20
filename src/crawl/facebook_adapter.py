@@ -13,17 +13,28 @@ from playwright.sync_api import Error as PlaywrightError, Page, TimeoutError as 
 
 from src.config import AppConfig
 from src.errors import AppError
-from src.identity import normalize_display
+from src.identity import make_post_id, normalize_display
 from src.models import ExtractedPost, ExtractionResult, FeedProgress, PostKind, SessionState
 
-ADAPTER_VERSION = 'facebook_dom_v2'
+ADAPTER_VERSION = 'facebook_dom_v3'
 MESSAGE = '[data-ad-preview="message"], [data-ad-rendering-role="story_message"], [data-testid="post_message"]'
 HEADER = '[data-ad-rendering-role="story_header"], h2, h3'
 POSITIONED_POST = '[aria-posinset]:has([data-virtualized])'
 POST_BOUNDARY = f'[role="article"], {POSITIONED_POST}'
 ARTICLE = f'[role="feed"] [role="article"], [role="main"] {POSITIONED_POST}:has({HEADER}, {MESSAGE})'
 MORE = {'see more', 'xem thêm'}
+EXPANSION_STATE = 'facebook-crawler.pending-expansion'
 ACCOUNT = re.compile(r'^(Your profile|Your account|Account|Trang cá nhân của bạn|Tài khoản của bạn|Tài khoản)$', re.I)
+
+IN_VIEWPORT = '''e => {
+    const r = e.getBoundingClientRect();
+    if (!e.isConnected || r.width <= 0 || r.height <= 0 || r.bottom <= 0 ||
+        r.top >= innerHeight || r.right <= 0 || r.left >= innerWidth) return false;
+    const visibility = getComputedStyle(e).visibility;
+    return visibility !== 'hidden' && visibility !== 'collapse';
+}'''
+VISIBLE_ARTICLES = '''(nodes, boundary) => nodes.filter(e =>
+    !e.parentElement.closest(boundary) && (''' + IN_VIEWPORT + ''')(e))'''
 
 # One ownership rule for both extraction and the final atomic text read. A
 # message may carry a chain of nested markers; branching markers remain ambiguous.
@@ -99,13 +110,20 @@ class FacebookAdapter:
             for i in range(headings.count()))
         account = page.get_by_role('button', name=ACCOUNT)
         has_account = any(account.nth(i).is_visible() for i in range(account.count()))
-        if has_heading and has_account and (page.locator('[role="feed"]').count() or self._articles(page)):
+        if has_heading and has_account and (page.locator('[role="feed"]').count() or page.locator(ARTICLE).count()):
             return SessionState.AUTHENTICATED
         return SessionState.UNKNOWN
 
     def _articles(self, page):
-        return [node for node in page.locator(ARTICLE).element_handles()
-                if node.evaluate('(e, boundary) => !e.parentElement.closest(boundary)', POST_BOUNDARY)]
+        # Filter geometry in the browser before transferring any post handles or text.
+        nodes = page.evaluate_handle('''args => (''' + VISIBLE_ARTICLES + ''')(
+            Array.from(document.querySelectorAll(args.selector)), args.boundary)''',
+            {'selector': ARTICLE, 'boundary': POST_BOUNDARY})
+        try:
+            return [element for handle in nodes.get_properties().values()
+                    if (element := handle.as_element()) is not None]
+        finally:
+            nodes.dispose()
 
     def _owned(self, article, selector):
         nodes = article.evaluate_handle(OWNED_NODES, {
@@ -145,43 +163,56 @@ class FacebookAdapter:
                       if not link.evaluate('(e, selector) => Boolean(e.closest(selector))', MESSAGE)]
         permalink = next((value for value in permalinks if value), '')
         message = messages[0] if len(messages) == 1 else None
+        # This pre-expansion token only correlates extraction failures with retries.
         signature_text = (message.inner_text() if message else '') + '\n' + action
         signature = permalink or 'dom_' + hashlib.sha256(signature_text.encode('utf-8')).hexdigest()
         return identity, kind, message, signature, permalink, len(messages)
 
     def visible_signatures(self, page: Page) -> frozenset[str]:
-        signatures = set()
-        for article in self._articles(page):
-            try:
-                details = self._details(article)
-                if details and details[0] == self.identity:
-                    signatures.add(details[3])
-            except PlaywrightError:
-                if page.is_closed():
-                    raise
-        return frozenset(signatures)
+        """Cheap viewport snapshots for scroll progress, never post identities."""
+        snapshots = page.locator(ARTICLE).evaluate_all('''(nodes, args) => {
+            const visible = (''' + VISIBLE_ARTICLES + ''')(nodes, args.boundary);
+            const owned = (''' + OWNED_NODES + ''');
+            return visible.map(article => {
+                const headers = owned(article, {...args, selector: args.header, message: false});
+                const header = headers[0];
+                const author = header && header.querySelector('a[href]');
+                const messages = owned(article, {...args, selector: args.body, message: true});
+                return {author: author && author.getAttribute('href'),
+                    text: JSON.stringify([header ? header.innerText : '', messages.map(e => e.innerText)])};
+            });
+        }''', {'boundary': POST_BOUNDARY, 'header': HEADER, 'body': MESSAGE})
+        return frozenset('viewport_' + hashlib.sha256(item['text'].encode('utf-8')).hexdigest()
+                         for item in snapshots if page_identity(item['author'] or '') == self.identity)
 
     @staticmethod
     def _message_snapshot(body):
-        return body.evaluate('''body => ({
+        return body.evaluate('''(body, key) => ({
             connected: body.isConnected,
             text: body.innerText,
+            pending: body[Symbol.for(key)] || null,
             collapsed: Array.from(body.querySelectorAll('button, [role="button"]')).some(
                 e => ['see more', 'xem thêm'].includes(e.innerText.trim().toLowerCase())),
             busy: Boolean(body.closest('[aria-busy="true"]') || body.querySelector('[aria-busy="true"], [role="progressbar"]'))
-        })''')
+        })''', EXPANSION_STATE)
 
-    def _expand(self, page, body, control) -> str:
+    def _expand(self, page, body, control, observation_id) -> str:
         # Removing the control alone is not evidence that the delayed text arrived.
         # Labels are removed only from the comparison; stored content stays intact.
         def comparison(text):
             return ' '.join(re.sub(r'see more|xem thêm', '', text, flags=re.I).split())
 
-        before = comparison(body.inner_text())
+        snapshot = self._message_snapshot(body)
+        pending = snapshot['pending'] or {'before': comparison(snapshot['text']), 'observation_id': observation_id}
+        # Keep this on the node across retries: a vanished button does not prove completion.
+        body.evaluate('(body, args) => { body[Symbol.for(args.key)] = args.pending; }',
+                      {'key': EXPANSION_STATE, 'pending': pending})
+        before = pending['before']
         timeout = self.config.crawl.action_timeout_seconds
         deadline = time.monotonic() + timeout
         quiet_seconds = min(0.25, timeout / 3)
-        control.click(timeout=timeout * 1000)
+        if control is not None:
+            control.click(timeout=timeout * 1000)
         candidate = None
         stable_since = time.monotonic()
         while time.monotonic() < deadline:
@@ -201,11 +232,15 @@ class FacebookAdapter:
     def extract_visible_posts(self, page: Page) -> Iterator[ExtractionResult]:
         articles = self._articles(page)
         if not articles:
-            yield ExtractionResult('layout:no_articles', error_code='UNSUPPORTED_LAYOUT')
+            if not page.locator(ARTICLE).count():
+                yield ExtractionResult('layout:no_articles', error_code='UNSUPPORTED_LAYOUT')
             return
         for article in articles:
             signature = 'layout:unrecognized'
             try:
+                # Expanding an earlier post can move the next one below the viewport.
+                if not article.evaluate(IN_VIEWPORT):
+                    continue
                 details = self._details(article)
                 if details is None:
                     yield ExtractionResult(signature, error_code='UNKNOWN_AUTHOR')
@@ -225,7 +260,18 @@ class FacebookAdapter:
                     continue
                 controls = [node for node in body.query_selector_all('button, [role="button"]')
                             if node.inner_text().strip().casefold() in MORE]
-                expanded_text = self._expand(page, body, controls[0]) if controls else None
+                snapshot = self._message_snapshot(body)
+                if snapshot['pending']:
+                    signature = snapshot['pending']['observation_id']
+                expanded_text = None
+                if controls or snapshot['pending']:
+                    position = page.evaluate('({x: window.scrollX, y: window.scrollY})')
+                    try:
+                        expanded_text = self._expand(page, body, controls[0] if controls else None, signature)
+                    finally:
+                        # Playwright may scroll to the control; keep unread posts ahead of the cursor.
+                        if not page.is_closed():
+                            page.evaluate('p => window.scrollTo({left: p.x, top: p.y, behavior: "instant"})', position)
                 if not body.evaluate('(e) => e.isConnected'):
                     raise PlaywrightTimeout('Message detached')
                 after = self._details(article)
@@ -240,8 +286,11 @@ class FacebookAdapter:
                 }''', {'article': article, 'selector': MESSAGE, 'boundary': POST_BOUNDARY, 'message': True}))
                 if expanded_text is not None and text != expanded_text:
                     raise PlaywrightTimeout('Expanded message changed before extraction')
+                if expanded_text is not None:
+                    body.evaluate('(body, key) => delete body[Symbol.for(key)]', EXPANSION_STATE)
                 if text:
-                    yield ExtractionResult(signature, ExtractedPost(text, permalink, kind))
+                    yield ExtractionResult(make_post_id(text), ExtractedPost(text, permalink, kind),
+                                           observation_id=signature)
                 else:
                     yield ExtractionResult(signature)
             except PlaywrightError:
@@ -251,13 +300,15 @@ class FacebookAdapter:
 
     def scroll_and_wait(self, page: Page) -> FeedProgress:
         before = self.visible_signatures(page)
-        page.evaluate('window.scrollBy(0, Math.max(600, window.innerHeight * 0.85))')
+        before_y = page.evaluate('window.scrollY')
+        page.evaluate('window.scrollBy(0, Math.max(1, window.innerHeight * 0.85))')
         page.wait_for_timeout(self.config.crawl.scroll_delay_seconds * 1000)
         deadline = time.monotonic() + self.config.crawl.feed_wait_timeout_seconds
         while True:
             signatures = self.visible_signatures(page)
-            if signatures != before or time.monotonic() >= deadline:
-                return FeedProgress(signatures)
+            advanced = page.evaluate('window.scrollY') > before_y
+            if advanced or signatures != before or time.monotonic() >= deadline:
+                return FeedProgress(signatures, advanced)
             if self.check_session(page) != SessionState.AUTHENTICATED:
-                return FeedProgress(signatures)
+                return FeedProgress(signatures, advanced)
             page.wait_for_timeout(min(250, max(1, (deadline - time.monotonic()) * 1000)))
