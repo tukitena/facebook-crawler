@@ -53,6 +53,19 @@ def test_chat_sends_schema_options_unicode_and_timeouts():
     assert len(requests) == 1
 
 
+@pytest.mark.parametrize(('target_relation', 'label'), [
+    ('unrelated', 'Positive'), ('unrelated', 'Negative'),
+    ('uncertain', 'Positive'), ('uncertain', 'Negative'),
+])
+def test_nonrelated_sentiment_is_normalized_to_neutral(target_relation, label):
+    content = json.dumps(PREDICTION | {'target_relation': target_relation, 'label': label})
+    response = chat_response(content=content)
+    with client_for(lambda _: httpx.Response(200, json=response)) as client:
+        result = client.classify_once('synthetic')
+    assert result.label == 'Neutral'
+    assert result.target_relation == target_relation
+
+
 @pytest.mark.parametrize('status,service', [(429, True), (500, True), (503, True)])
 def test_retryable_http_error_is_one_request_and_safe(status, service):
     requests = []
@@ -109,7 +122,6 @@ def test_transport_errors_are_retryable_service_failures(error):
     chat_response(content='{"label":"Neutral","label":"Positive"}'),
     chat_response(content=json.dumps(PREDICTION | {'confidence': float('nan')})),
     chat_response(content=json.dumps(PREDICTION | {'confidence': '0.9'})),
-    chat_response(content=json.dumps(PREDICTION | {'label': 'Positive'})),
     chat_response(content=json.dumps(PREDICTION | {'extra': True})),
     chat_response(content='[]'), chat_response(content='{}'),
 ])

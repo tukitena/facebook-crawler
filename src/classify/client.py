@@ -51,6 +51,14 @@ def _validation_error() -> ModelAttemptError:
                              retryable=True, service_failure=False)
 
 
+def _normalize_target_label(value):
+    if (isinstance(value, dict)
+            and value.get('target_relation') in {'unrelated', 'uncertain'}
+            and value.get('label') in {'Positive', 'Negative'}):
+        return value | {'label': 'Neutral'}
+    return value
+
+
 def _retry_after(value: str | None) -> float | None:
     if value is None:
         return None
@@ -129,7 +137,8 @@ class OllamaClient:
                 or not isinstance(message, dict) or not isinstance(message.get('content'), str)):
             raise _validation_error()
         try:
-            return ModelPrediction.model_validate(_strict_json(message['content']))
+            value = _normalize_target_label(_strict_json(message['content']))
+            return ModelPrediction.model_validate(value)
         except (ValueError, UnicodeError, RecursionError, ValidationError):
             raise _validation_error() from None
 
