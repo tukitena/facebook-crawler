@@ -8,13 +8,14 @@ import sys
 import tempfile
 import threading
 from contextlib import contextmanager
+from collections.abc import Iterator
 from pathlib import Path
 
 import portalocker
 from pydantic import ValidationError
 
 from src.errors import AppError
-from src.identity import NORMALIZATION_VERSION, canonical_text
+from src.identity import NORMALIZATION_VERSION, canonical_text, make_post_id
 from src.models import RawPost
 
 RAW_FIELDS = ['id', 'content', 'crawled_at', 'source_url', 'post_kind']
@@ -75,6 +76,48 @@ def atomic_write_json(path: Path, payload: dict[str, object]) -> None:
         raise AppError('STORAGE_ERROR', f'Không ghi được {path}; kiểm tra dung lượng/quyền ghi.') from exc
 
 
+def _read_raw_records(path: Path, *, identity_error: str = 'INVALID_CSV') -> Iterator[RawPost]:
+    with path.open('rb') as stream:
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() < 3:
+            raise AppError('INVALID_CSV', 'CSV thiếu header hoặc bị cắt dở.', 2)
+        stream.seek(-1, os.SEEK_END)
+        if stream.read(1) != b'\n':
+            raise AppError('INVALID_CSV', 'CSV thiếu dấu kết thúc record; giữ nguyên để khôi phục.', 2)
+    try:
+        with path.open(encoding='utf-8-sig', newline='') as stream:
+            reader = csv.reader(stream, strict=True)
+            if next(reader, None) != RAW_FIELDS:
+                raise ValueError('Wrong header')
+            for row in reader:
+                if len(row) != len(RAW_FIELDS):
+                    raise ValueError('Wrong field count')
+                if row[0] != make_post_id(row[1]):
+                    raise AppError(identity_error, 'ID raw không khớp nội dung; giữ nguyên để kiểm tra.', 2)
+                yield RawPost.model_validate(dict(zip(RAW_FIELDS, row)))
+    except (ValueError, UnicodeError, csv.Error, ValidationError) as exc:
+        raise AppError('INVALID_CSV', 'CSV sai schema hoặc bị cắt dở; giữ nguyên để kiểm tra.', 2) from exc
+
+
+def iter_raw_posts(path: Path, page_url: str) -> Iterator[RawPost]:
+    """Read validated raw records without creating files or deduplicating them."""
+    path = Path(path)
+    try:
+        if not path.exists():
+            raise AppError('INPUT_NOT_FOUND', f'Chưa có file raw: {path}', 2)
+        expected = {'schema_version': 1, 'page_url': page_url,
+                    'normalization_version': NORMALIZATION_VERSION}
+        try:
+            metadata = json.loads(path.with_suffix('.meta.json').read_text(encoding='utf-8'))
+        except (FileNotFoundError, ValueError, UnicodeError) as exc:
+            raise AppError('RESUME_MISMATCH', 'Metadata raw thiếu hoặc không hợp lệ.', 2) from exc
+        if metadata != expected:
+            raise AppError('RESUME_MISMATCH', 'Page/schema/normalization raw không khớp.', 2)
+        yield from _read_raw_records(path, identity_error='IDENTITY_CONFLICT')
+    except OSError as exc:
+        raise AppError('STORAGE_ERROR', f'Không đọc được dữ liệu raw: {path}') from exc
+
+
 class RawPostStore:
     def __init__(self, path: Path, page_url: str):
         self.path = Path(path)
@@ -97,27 +140,10 @@ class RawPostStore:
             raise AppError('RESUME_MISMATCH', 'CSV hiện có thiếu metadata; không tự ghi đè.', 2)
         if not self.path.exists():
             return
-        with self.path.open('rb') as stream:
-            stream.seek(0, os.SEEK_END)
-            if stream.tell() < 3:
-                raise AppError('INVALID_CSV', 'CSV thiếu header hoặc bị cắt dở.', 2)
-            stream.seek(-1, os.SEEK_END)
-            if stream.read(1) != b'\n':
-                raise AppError('INVALID_CSV', 'CSV thiếu dấu kết thúc record; giữ nguyên để khôi phục.', 2)
-        try:
-            with self.path.open(encoding='utf-8-sig', newline='') as stream:
-                reader = csv.reader(stream, strict=True)
-                if next(reader, None) != RAW_FIELDS:
-                    raise ValueError('Wrong header')
-                for row in reader:
-                    if len(row) != len(RAW_FIELDS):
-                        raise ValueError('Wrong field count')
-                    post = RawPost.model_validate(dict(zip(RAW_FIELDS, row)))
-                    if post.id in self.existing:
-                        raise ValueError('Duplicate stored ID')
-                    self.existing[post.id] = canonical_text(post.content)
-        except (ValueError, UnicodeError, csv.Error, ValidationError) as exc:
-            raise AppError('INVALID_CSV', 'CSV sai schema/ID hoặc bị cắt dở; giữ nguyên để kiểm tra.', 2) from exc
+        for post in _read_raw_records(self.path):
+            if post.id in self.existing:
+                raise AppError('INVALID_CSV', 'CSV chứa ID trùng; giữ nguyên để kiểm tra.', 2)
+            self.existing[post.id] = canonical_text(post.content)
 
     def __enter__(self):
         try:

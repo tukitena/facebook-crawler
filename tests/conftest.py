@@ -26,3 +26,30 @@ def page(browser):
 @pytest.fixture
 def feed_html():
     return (Path(__file__).parent / 'fixtures/facebook_feed.html').read_text(encoding='utf-8')
+
+
+@pytest.fixture
+def raw_dataset(tmp_path):
+    """Seed independent, synthetic datasets without requiring a browser."""
+    from itertools import count
+    from src.config import load_config
+    from src.identity import make_post_id, normalize_display
+    from src.models import RawPost
+    from src.storage import RawPostStore
+
+    sequence = count()
+
+    def create(texts):
+        root = tmp_path / f'dataset-{next(sequence)}'
+        root.mkdir()
+        config_path = root / 'config.yaml'
+        config_path.write_text('{}', encoding='utf-8')
+        config = load_config(config_path)
+        with RawPostStore(config.paths.raw_csv, config.facebook.page_url) as writer:
+            for text in texts:
+                content = normalize_display(text)
+                writer.append(RawPost(id=make_post_id(content), content=content,
+                                      crawled_at='2026-10-20T00:00:00Z', post_kind='text'))
+        return config
+
+    return create
