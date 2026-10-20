@@ -1,3 +1,7 @@
+class CrawlCancelled(Exception):
+    """The user declined to start crawling."""
+
+
 class AppError(Exception):
     """An operational error safe to display without browser/session details."""
 

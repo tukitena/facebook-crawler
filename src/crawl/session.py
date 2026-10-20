@@ -9,7 +9,7 @@ from playwright.sync_api import BrowserContext, BrowserType, Error as Playwright
 from src.config import AppConfig
 from src.crawl.chrome import launch_manual_chrome, resolve_chrome
 from src.crawl.facebook_adapter import FacebookAdapter
-from src.errors import AppError
+from src.errors import AppError, CrawlCancelled
 from src.models import SessionState
 
 logger = logging.getLogger('crawler')
@@ -17,7 +17,7 @@ LOGIN_MESSAGE = ('Hãy đăng nhập Facebook trong cửa sổ Chrome vừa mở
                  'đóng các cửa sổ Chrome dùng profile này rồi nhấn Enter. ')
 BUSY_MESSAGE = 'Profile đang được Chrome sử dụng. Đóng các cửa sổ Chrome dùng profile này rồi nhấn Enter. '
 START_MESSAGE = ('Hãy chờ trang Facebook tải xong trong cửa sổ Chrome vừa mở. '
-                 'Khi sẵn sàng bắt đầu crawl, nhập y hoặc nhấn Enter: ')
+                 'Nhập y để bắt đầu crawl, nhập n để kết thúc: ')
 
 
 def navigate_with_retry(page: Page, url: str, timeout_ms: int, sleep_fn=time.sleep) -> None:
@@ -56,10 +56,12 @@ class SessionManager:
         def read_confirmation():
             try:
                 while True:
-                    answer = self.input_fn(START_MESSAGE)
-                    if answer.strip().casefold() in ('', 'y'):
+                    answer = self.input_fn(START_MESSAGE).strip().casefold()
+                    if answer == 'y':
                         outcome.put(None)
                         return
+                    if answer == 'n':
+                        raise CrawlCancelled()
             except BaseException as exc:
                 # Deliver input failures, including interruption, to the owning thread.
                 outcome.put(exc)

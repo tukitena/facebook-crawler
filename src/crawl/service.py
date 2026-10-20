@@ -14,7 +14,7 @@ from playwright.sync_api import Page, sync_playwright
 from src.config import AppConfig
 from src.crawl.facebook_adapter import ADAPTER_VERSION, FacebookAdapter
 from src.crawl.session import SessionManager
-from src.errors import AppError
+from src.errors import AppError, CrawlCancelled
 from src.identity import make_post_id, normalize_display
 from src.models import CrawlStats, CrawlSummary, RawPost, SessionState, utc_now
 from src.storage import RawPostStore, atomic_write_json, defer_sigint, resource_lock
@@ -176,6 +176,9 @@ def crawl(config: AppConfig, *, progress: Callable[[CrawlStats], None] | None = 
                                 if not active_error:
                                     raise
                                 logger.error('cleanup_failed', extra={'event': 'cleanup_failed', 'error_code': 'BROWSER_CLOSE'})
+        return summary
+    except CrawlCancelled:
+        summary.status, summary.stop_reason, summary.exit_code = 'cancelled', 'user_cancelled', 0
         return summary
     except KeyboardInterrupt:
         summary.status, summary.stop_reason, summary.exit_code = 'interrupted', 'keyboard_interrupt', 130

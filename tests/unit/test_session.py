@@ -5,8 +5,8 @@ import pytest
 from playwright.sync_api import Error, TimeoutError
 
 from src.config import AppConfig
-from src.crawl.session import SessionManager, navigate_with_retry
-from src.errors import AppError
+from src.crawl.session import START_MESSAGE, SessionManager, navigate_with_retry
+from src.errors import AppError, CrawlCancelled
 from src.models import SessionState as S
 
 
@@ -36,7 +36,7 @@ def setup(tmp_path, monkeypatch, states, fresh=False, interactive=True):
     adapter.check_session.side_effect = states
     def confirm(message):
         events.append('enter')
-        return ''
+        return 'y' if message == START_MESSAGE else ''
     prompt = Mock(side_effect=confirm)
     manager = SessionManager(config, chromium, adapter, input_fn=prompt,
                              is_interactive=lambda: interactive, sleep_fn=lambda _: None)
@@ -98,7 +98,7 @@ def test_unknown_page_is_not_success(tmp_path, monkeypatch):
     launcher.assert_not_called()
 
 
-@pytest.mark.parametrize('answer', ['', 'y', 'Y', ' y '])
+@pytest.mark.parametrize('answer', ['y', 'Y', ' y '])
 def test_user_confirms_after_navigation_before_session_check(tmp_path, monkeypatch, answer):
     manager, _, contexts, _, events = setup(tmp_path, monkeypatch, [])
     ready = False
@@ -170,7 +170,7 @@ def test_interrupt_during_confirmation_pump_closes_context_without_waiting_for_i
 
     def confirm(message):
         release_input.wait(1)
-        return ''
+        return 'y'
 
     chromium.launch_persistent_context.side_effect = launch_context
     manager.input_fn = confirm
@@ -184,9 +184,9 @@ def test_interrupt_during_confirmation_pump_closes_context_without_waiting_for_i
         release_input.set()
 
 
-def test_start_confirmation_reprompts_until_y_or_enter(tmp_path, monkeypatch):
+def test_start_confirmation_reprompts_until_y(tmp_path, monkeypatch):
     manager, _, contexts, _, _ = setup(tmp_path, monkeypatch, [S.AUTHENTICATED])
-    answers = iter(['no', 'yes', 'y'])
+    answers = iter(['', '   ', 'no', 'yes', 'x', 'y'])
 
     def confirm(message):
         manager.adapter.check_session.assert_not_called()
@@ -194,8 +194,21 @@ def test_start_confirmation_reprompts_until_y_or_enter(tmp_path, monkeypatch):
 
     manager.input_fn = Mock(side_effect=confirm)
     assert manager.ensure_authenticated() is contexts[0]
-    assert manager.input_fn.call_count == 3
+    assert manager.input_fn.call_count == 6
+    assert all(call.args == (START_MESSAGE,) for call in manager.input_fn.call_args_list)
     manager.adapter.check_session.assert_called_once()
+
+
+@pytest.mark.parametrize('answer', ['n', 'N', ' n '])
+def test_declining_start_closes_context_without_checking_session(tmp_path, monkeypatch, answer):
+    manager, _, contexts, launcher, _ = setup(tmp_path, monkeypatch, [S.AUTHENTICATED])
+    manager.input_fn.side_effect = ['', 'invalid', answer]
+    with pytest.raises(CrawlCancelled):
+        manager.ensure_authenticated()
+    assert manager.input_fn.call_count == 3
+    manager.adapter.check_session.assert_not_called()
+    contexts[0].close.assert_called_once()
+    launcher.assert_not_called()
 
 
 def test_confirmation_checks_unknown_session_once_without_polling(tmp_path, monkeypatch):

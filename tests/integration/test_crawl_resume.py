@@ -5,6 +5,7 @@ import pytest
 
 from src.config import load_config
 from src.crawl.service import crawl, crawl_feed
+from src.errors import CrawlCancelled
 from src.models import CrawlStats, ExtractedPost, ExtractionResult, FeedProgress, SessionState
 from src.storage import RawPostStore, resource_lock
 
@@ -15,6 +16,36 @@ def config_at(tmp_path):
     path = tmp_path / 'config.yaml'
     path.write_text('crawl: {max_posts: 1, max_scrolls: 1}')
     return load_config(path)
+
+
+def test_declining_start_releases_resources_and_reports_cancellation(tmp_path, monkeypatch):
+    import src.crawl.service as module
+    config = config_at(tmp_path)
+    runtime = Mock()
+    runtime.__enter__ = Mock(return_value=runtime)
+    runtime.__exit__ = Mock(return_value=False)
+    monkeypatch.setattr(module, 'sync_playwright', lambda: runtime)
+    session = Mock()
+    session.ensure_authenticated.side_effect = CrawlCancelled()
+    monkeypatch.setattr(module, 'SessionManager', lambda *a, **k: session)
+    feed = Mock()
+    monkeypatch.setattr(module, 'crawl_feed', feed)
+
+    result = crawl(config)
+
+    assert (result.status, result.stop_reason, result.exit_code) == ('cancelled', 'user_cancelled', 0)
+    assert result.stats.saved_posts == 0
+    feed.assert_not_called()
+    runtime.__exit__.assert_called_once()
+    with resource_lock(config.paths.data_dir / '.dataset.lock'):
+        pass
+    profile = config.chrome.user_data_dir
+    with resource_lock(profile.with_name(profile.name + '.lock')):
+        pass
+    with RawPostStore(config.paths.raw_csv, URL) as store:
+        assert not store.existing
+    report = json.loads((config.paths.reports_dir / f'{result.run_id}.json').read_text(encoding='utf-8'))
+    assert (report['status'], report['stop_reason'], report['exit_code']) == ('cancelled', 'user_cancelled', 0)
 
 
 def test_interrupt_then_resume_without_duplicates(tmp_path):
